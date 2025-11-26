@@ -30,7 +30,7 @@ app = FastAPI()
 
 FRONTEND_ORIGINS = [
     "http://localhost:5500",              # local dev
-    "https://YOUR-SITE.netlify.app",      # replace with your real Netlify URL
+    "https://equinoxbot.netlify.app",      # replace with your real Netlify URL
 ]
 
 # allow your Netlify site to talk to this backend
@@ -240,3 +240,4 @@ async def check_premium(discord_id: int):
 @app.get("/")
 async def root():
     return {"ok": True}
+
