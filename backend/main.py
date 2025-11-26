@@ -249,52 +249,6 @@ def me(request: Request):
         "expires_at": expires,
     }
 
-@app.post("/api/test-cryptomus-webhook")
-async def api_test_cryptomus_webhook(request: Request):
-    """
-    Call Cryptomus /v1/test-webhook/payment to send a fake 'paid' webhook
-    to our /api/cryptomus/webhook endpoint.
-    No real crypto is moved. This is only for testing signature + delivery.
-    """
-    if not CRYPTOMUS_MERCHANT_ID or not CRYPTOMUS_API_KEY:
-        raise HTTPException(status_code=500, detail="Cryptomus not configured")
-
-    base_url = f"{request.url.scheme}://{request.url.netloc}"
-    url_callback = f"{base_url}/api/cryptomus/webhook"
-
-    # You can adjust currency/network to match a real one you support
-    test_payload = {
-        "currency": "USDT",
-        "network": "tron",
-        "url_callback": url_callback,
-        "status": "paid",
-        # Optional: you can also pass uuid/order_id if you want
-        # "uuid": "test-uuid-123",
-        # "order_id": "test-order-1",
-    }
-
-    body_str = json.dumps(test_payload, ensure_ascii=False, separators=(",", ":"))
-    sign = cryptomus_sign_request_body(body_str)
-
-    headers = {
-        "merchant": CRYPTOMUS_MERCHANT_ID,
-        "sign": sign,
-        "Content-Type": "application/json",
-    }
-
-    async with httpx.AsyncClient() as client_http:
-        res = await client_http.post(
-            "https://api.cryptomus.com/v1/test-webhook/payment",
-            headers=headers,
-            content=body_str.encode("utf-8"),
-            timeout=20,
-        )
-
-    print("CRYPTOMUS TEST WEBHOOK STATUS:", res.status_code)
-    print("CRYPTOMUS TEST WEBHOOK BODY:", res.text)
-
-    return {"ok": True, "status": res.status_code, "body": res.text}
-
 
 @app.post("/api/create-invoice")
 async def create_invoice(request: Request, body: dict = Body(...)):
@@ -329,6 +283,7 @@ async def create_invoice(request: Request, body: dict = Body(...)):
 
     # where to send the user back if they click "Back to site" on the payment page
     url_return = FRONTEND_URL or "https://equinoxbot.netlify.app/premium.html"
+    url_success = "https://equinoxbot.netlify.app/thankyou.html"
 
     # our webhook endpoint (this is the important part!)
     base_url = f"{request.url.scheme}://{request.url.netloc}"
@@ -341,6 +296,7 @@ async def create_invoice(request: Request, body: dict = Body(...)):
         "currency": "USD",
         "order_id": order_id,
         "url_return": url_return,
+        "url_success": url_success,   
         "url_callback": url_callback,
         "is_payment_multiple": False,
         "lifetime": 3600,
@@ -396,30 +352,37 @@ async def cryptomus_webhook(
     sign: str | None = Header(default=None),
 ):
     """
-    VERY FORGIVING TEST VERSION:
+    Secure Cryptomus webhook:
 
-    - Accepts both real and test-webhook payloads
-    - Ignores signature for now (so test-webhook always works)
-    - If no discord_id/plan in payload, use your hardcoded ID + 'monthly'
-    - Writes JSON via add_subscription()
+    - Verifies signature using payment API key
+    - Only acts on 'paid' / 'paid_over'
+    - Requires valid discord_id + plan in additional_data/custom
+    - Writes subscription via add_subscription()
     """
+    if not CRYPTOMUS_MERCHANT_ID or not CRYPTOMUS_API_KEY:
+        raise HTTPException(status_code=500, detail="Cryptomus not configured")
 
-    print("=== CRYPTOMUS WEBHOOK HIT ===")
-    print("Raw payload:", json.dumps(payload, indent=2, ensure_ascii=False))
-    print("Header sign:", sign)
+    if not sign:
+        raise HTTPException(status_code=400, detail="Missing signature header")
 
-    # 🔹 Some Cryptomus webhooks wrap data in "result"
+    # Some webhooks wrap data in "result"
     data = payload.get("result") if isinstance(payload.get("result"), dict) else payload
 
-    status = data.get("status") or data.get("payment_status")
-    print("Status inside webhook:", status)
+    # Verify signature
+    expected_sign = cryptomus_sign(data)  # make sure this matches your helper
+    if sign != expected_sign:
+        print("❌ Invalid Cryptomus signature")
+        raise HTTPException(status_code=401, detail="Invalid signature")
 
-    # Only handle successful payments / test-paid
+    print("=== CRYPTOMUS WEBHOOK (verified) ===")
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+
+    status = data.get("status") or data.get("payment_status")
     if status not in ("paid", "paid_over"):
-        print("Non-paid status, ignoring.")
+        print("Non-paid status, ignoring:", status)
         return {"ok": True, "message": f"Ignored status {status}"}
 
-    # 🔹 Try to read custom/extra data if present (real payments)
+    # Read custom data (what you passed as additional_data/custom in /v1/payment)
     custom_raw = (
         data.get("additional_data")
         or data.get("custom")
@@ -428,25 +391,23 @@ async def cryptomus_webhook(
 
     try:
         custom = json.loads(custom_raw)
-    except Exception:
+    except Exception as e:
+        print("Failed to parse additional_data/custom:", e, custom_raw)
         custom = {}
 
     discord_id = custom.get("discord_id")
     plan = custom.get("plan")
 
-    # 🔥 TEST-WEBHOOK / fallback: if missing discord_id/plan, hardcode them
     if not discord_id or not plan:
-        print("No discord_id/plan in webhook: assuming TEST WEBHOOK, using defaults.")
-        # ⬇️ CHANGE THIS TO YOUR REAL DISCORD ID
-        discord_id = 857932717681147954
-        plan = "monthly"
+        # For security, do NOT auto grant anything if these are missing
+        print("Missing discord_id/plan in webhook custom data; ignoring.")
+        return {"ok": True, "message": "Missing discord_id/plan; no subscription granted"}
 
-    # Pick something to store as "code" (invoice id or test id)
     invoice_id = (
         data.get("uuid")
         or data.get("transaction_id")
         or data.get("order_id")
-        or "cryptomus-test"
+        or "cryptomus"
     )
 
     try:
