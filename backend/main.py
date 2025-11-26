@@ -270,7 +270,7 @@ async def create_invoice(request: Request, body: dict = Body(...)):
     elif plan == "yearly":
         amount = "0.10"
     elif plan == "lifetime":
-        amount = "0.10"
+        amount = "10.10"
     else:
         raise HTTPException(status_code=400, detail="Invalid plan")
 
@@ -298,8 +298,8 @@ async def create_invoice(request: Request, body: dict = Body(...)):
         "url_return": url_return,
         "url_success": url_success,   
         "url_callback": url_callback,
-        "is_payment_multiple": False,
-        "lifetime": 3600,
+        "is_payment_multiple": True,
+        "lifetime": 7200,
         "additional_data": json.dumps(custom_data, ensure_ascii=False),
     }
 
