@@ -249,6 +249,51 @@ def me(request: Request):
         "expires_at": expires,
     }
 
+@app.post("/api/test-cryptomus-webhook")
+async def api_test_cryptomus_webhook(request: Request):
+    """
+    Call Cryptomus /v1/test-webhook/payment to send a fake 'paid' webhook
+    to our /api/cryptomus/webhook endpoint.
+    No real crypto is moved. This is only for testing signature + delivery.
+    """
+    if not CRYPTOMUS_MERCHANT_ID or not CRYPTOMUS_API_KEY:
+        raise HTTPException(status_code=500, detail="Cryptomus not configured")
+
+    base_url = f"{request.url.scheme}://{request.url.netloc}"
+    url_callback = f"{base_url}/api/cryptomus/webhook"
+
+    # You can adjust currency/network to match a real one you support
+    test_payload = {
+        "currency": "USDT",
+        "network": "tron",
+        "url_callback": url_callback,
+        "status": "paid",
+        # Optional: you can also pass uuid/order_id if you want
+        # "uuid": "test-uuid-123",
+        # "order_id": "test-order-1",
+    }
+
+    body_str = json.dumps(test_payload, ensure_ascii=False, separators=(",", ":"))
+    sign = cryptomus_sign_request_body(body_str)
+
+    headers = {
+        "merchant": CRYPTOMUS_MERCHANT_ID,
+        "sign": sign,
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient() as client_http:
+        res = await client_http.post(
+            "https://api.cryptomus.com/v1/test-webhook/payment",
+            headers=headers,
+            content=body_str.encode("utf-8"),
+            timeout=20,
+        )
+
+    print("CRYPTOMUS TEST WEBHOOK STATUS:", res.status_code)
+    print("CRYPTOMUS TEST WEBHOOK BODY:", res.text)
+
+    return {"ok": True, "status": res.status_code, "body": res.text}
 
 
 @app.post("/api/create-invoice")
