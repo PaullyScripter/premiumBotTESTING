@@ -1,6 +1,7 @@
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Dict, Any
 
 # Path: backend/
 BASE_DIR = Path(__file__).resolve().parent
@@ -106,3 +107,20 @@ def user_is_active(user_id: int):
 
     # no entry found
     return False, None, None
+
+def grant_subscription_from_webhook(user_id: int, plan: str, payload: Dict[str, Any]) -> None:
+    """
+    Called by the webhook once a payment is confirmed.
+
+    plan: "monthly" / "yearly" / "lifetime"
+    payload: full Cryptomus webhook JSON (we use it just to store an invoice id).
+    """
+    tier = (plan or "").lower()
+    if tier not in ("monthly", "yearly", "lifetime"):
+        raise ValueError(f"Unknown plan type: {plan}")
+
+    # Use Cryptomus identifiers as the "code" field in your JSON
+    invoice_id = payload.get("uuid") or payload.get("order_id") or "cryptomus"
+
+    # Reuse your existing subscription logic
+    add_subscription(user_id, tier, invoice_id)
