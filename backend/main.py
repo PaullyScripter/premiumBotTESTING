@@ -4,6 +4,7 @@ from urllib.parse import urlencode
 
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import APIRouter
 from fastapi import Body
@@ -249,6 +250,26 @@ def me(request: Request):
         "expires_at": expires,
     }
 
+@app.get("/api/premium")
+def api_premium_me(request: Request):
+    """
+    Premium status for the currently logged-in user (via Discord session).
+    Frontend uses this for premium.html and thankyou.html.
+    """
+    user = get_user_from_session(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not logged in")
+
+    discord_id = int(user["id"])
+    active, tier, expires = user_is_active(discord_id)
+
+    return {
+        "premium": active,
+        "tier": tier,
+        "expires_at": expires,
+    }
+
+
 
 @app.post("/api/create-invoice")
 async def create_invoice(request: Request, body: dict = Body(...)):
@@ -265,10 +286,11 @@ async def create_invoice(request: Request, body: dict = Body(...)):
 
     plan = (body.get("plan") or "monthly").lower()
 
+    # 💰 real prices here:
     if plan == "monthly":
-        amount = "0.90"
+        amount = "2.99"
     elif plan == "yearly":
-        amount = "0.90"
+        amount = "29.99"
     elif plan == "lifetime":
         amount = "10.10"
     else:
@@ -296,7 +318,7 @@ async def create_invoice(request: Request, body: dict = Body(...)):
         "currency": "USD",
         "order_id": order_id,
         "url_return": url_return,
-        "url_success": url_success,   
+        "url_success": url_success,
         "url_callback": url_callback,
         "is_payment_multiple": True,
         "lifetime": 7200,
@@ -332,8 +354,6 @@ async def create_invoice(request: Request, body: dict = Body(...)):
 
     data = res.json()
 
-    # According to the docs you pasted, response is:
-    # { "state": 0, "result": { ... "url": "https://pay.cryptomus.com/pay/..." } }
     result = data.get("result") or {}
     invoice_url = result.get("url")
     if not invoice_url:
@@ -344,7 +364,6 @@ async def create_invoice(request: Request, body: dict = Body(...)):
         "order_id": result.get("order_id") or order_id,
         "uuid": result.get("uuid"),
     }
-
 
 @app.post("/api/cryptomus/webhook")
 async def cryptomus_webhook(
