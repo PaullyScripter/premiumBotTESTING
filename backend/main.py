@@ -266,11 +266,11 @@ async def create_invoice(request: Request, body: dict = Body(...)):
     plan = (body.get("plan") or "monthly").lower()
 
     if plan == "monthly":
-        amount = "5.00"
+        amount = "0.10"
     elif plan == "yearly":
-        amount = "40.00"
+        amount = "0.10"
     elif plan == "lifetime":
-        amount = "80.00"
+        amount = "0.10"
     else:
         raise HTTPException(status_code=400, detail="Invalid plan")
 
