@@ -102,13 +102,15 @@ def _cryptomus_build_sign_body(data: dict) -> str:
     json_str = json_str.replace("/", r"\/")  # match PHP behavior Cryptomus expects
     return json_str
 
-def cryptomus_sign_request(data: dict) -> str:
+def cryptomus_sign_request_body(body_str: str) -> str:
     """
-    Signature for creating an invoice via /v1/payment:
-    MD5(base64(JSON) + API_KEY)
+    Sign for /v1/payment:
+    MD5( base64( body_str ) + API_KEY )
     """
-    json_str = _cryptomus_build_sign_body(data)
-    b64 = base64.b64encode(json_str.encode("utf-8")).decode("utf-8")
+    if not CRYPTOMUS_API_KEY:
+        raise RuntimeError("CRYPTOMUS_API_KEY not set")
+
+    b64 = base64.b64encode(body_str.encode("utf-8")).decode("utf-8")
     return hashlib.md5((b64 + CRYPTOMUS_API_KEY).encode("utf-8")).hexdigest()
 
 def cryptomus_sign(data: dict) -> str:
@@ -294,13 +296,17 @@ async def create_invoice(request: Request, body: dict = Body(...)):
         "currency": "USD",
         "order_id": order_id,
         "url_return": url_return,
-        "url_callback": url_callback,            # 👈 THIS tells Cryptomus where to send the webhook
+        "url_callback": url_callback,
         "is_payment_multiple": False,
         "lifetime": 3600,
-        "additional_data": json.dumps(custom_data),
+        "additional_data": json.dumps(custom_data, ensure_ascii=False),
     }
 
-    sign = cryptomus_sign_request(invoice_payload)  # your MD5(base64(json)+API_KEY) helper
+    # 1) build the exact JSON string Cryptomus will receive
+    body_str = json.dumps(invoice_payload, ensure_ascii=False, separators=(",", ":"))
+
+    # 2) compute sign from that string
+    sign = cryptomus_sign_request_body(body_str)
 
     headers = {
         "merchant": CRYPTOMUS_MERCHANT_ID,
@@ -308,11 +314,12 @@ async def create_invoice(request: Request, body: dict = Body(...)):
         "Content-Type": "application/json",
     }
 
+    # 3) send that same string as the body
     async with httpx.AsyncClient() as client_http:
         res = await client_http.post(
             "https://api.cryptomus.com/v1/payment",
             headers=headers,
-            json=invoice_payload,
+            content=body_str.encode("utf-8"),
             timeout=20,
         )
 
