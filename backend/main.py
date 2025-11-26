@@ -266,9 +266,9 @@ async def create_invoice(request: Request, body: dict = Body(...)):
     plan = (body.get("plan") or "monthly").lower()
 
     if plan == "monthly":
-        amount = "0.10"
+        amount = "0.90"
     elif plan == "yearly":
-        amount = "0.10"
+        amount = "0.90"
     elif plan == "lifetime":
         amount = "10.10"
     else:
