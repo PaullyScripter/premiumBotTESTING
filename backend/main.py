@@ -19,7 +19,7 @@ import httpx
 from typing import Literal
 import hashlib
 import base64
-from subscriptions import add_subscription, user_is_active
+from subscriptions import add_subscription, user_is_active, grant_subscription_from_webhook
 
 
 # Always load the .env that lives in the same folder as main.py
@@ -130,6 +130,34 @@ def cryptomus_sign(data: dict) -> str:
     json_str = _cryptomus_build_sign_body(tmp)
     b64 = base64.b64encode(json_str.encode("utf-8")).decode("utf-8")
     return hashlib.md5((b64 + CRYPTOMUS_API_KEY).encode("utf-8")).hexdigest()
+
+def cryptomus_verify_webhook_signature(raw_body: bytes, header_sign: str | None) -> dict:
+    """
+    Verify Cryptomus webhook signature using the Payment API key.
+
+    sign = md5( base64(json_body) + PAYMENT_API_KEY )
+    """
+    if not CRYPTOMUS_API_KEY:
+        raise HTTPException(status_code=500, detail="Cryptomus API key not configured")
+
+    if not header_sign:
+        raise HTTPException(status_code=400, detail="Missing signature")
+
+    # Cryptomus signs the RAW JSON body, not our parsed dict
+    b64 = base64.b64encode(raw_body).decode("utf-8")
+    expected = hashlib.md5((b64 + CRYPTOMUS_API_KEY).encode("utf-8")).hexdigest()
+
+    if header_sign != expected:
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    # If signature is OK, parse JSON
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    return payload
+
 
 @app.get("/api/premium/{discord_id}")
 def api_premium(discord_id: int):
@@ -451,43 +479,31 @@ async def cryptomus_webhook(
 ):
     """
     Real Cryptomus webhook:
-    - verify signature using raw JSON body
-    - accept status 'paid' or 'paid_over'
-    - read custom/additional_data (discord_id, plan)
-    - call add_subscription(...) which writes the JSON files
+    - verify signature with PAYMENT API KEY
+    - check status
+    - parse discord_id + plan from their extra data
+    - grant subscription
     """
-    if not CRYPTOMUS_API_KEY or not CRYPTOMUS_MERCHANT_ID:
+    if not CRYPTOMUS_MERCHANT_ID or not CRYPTOMUS_API_KEY:
         raise HTTPException(status_code=500, detail="Cryptomus not configured")
 
-    # 1) Read raw body exactly as Cryptomus sent it
-    raw = await request.body()
-    body_str = raw.decode("utf-8", errors="ignore")
+    # Read raw body exactly as Cryptomus sent it
+    raw_body = await request.body()
 
-    print("=== CRYPTOMUS WEBHOOK BODY ===", body_str)
-    print("=== CRYPTOMUS WEBHOOK HEADER SIGN ===", sign)
+    # 1) Verify the signature, get parsed payload back
+    payload = cryptomus_verify_webhook_signature(raw_body, sign)
 
-    # 2) Signature must be present
-    if not sign:
-        raise HTTPException(status_code=400, detail="Missing signature")
+    # 2) Status handling
+    status = payload.get("status")
+    if status not in ("paid", "paid_over"):
+        # ignore pending/cancel/fail/etc
+        return {"ok": True, "message": f"Ignored status {status}"}
 
-    # 3) Rebuild signature from raw JSON + PAYMENT API KEY
-    expected_sign = cryptomus_sign_string(body_str)
-    if sign != expected_sign:
-        print("WEBHOOK SIGN MISMATCH. expected:", expected_sign)
-        raise HTTPException(status_code=401, detail="Invalid signature")
-
-    # 4) Parse JSON
-    try:
-        payload = json.loads(body_str)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    # Cryptomus sometimes uses status / payment_status
-    status = payload.get("status") or payload.get("payment_status")
-
-    # Your Discord id + plan come from here:
-    # we handle both 'custom' and 'additional_data' keys, either is fine
+    # 3) Extract our custom data (depending on how we created the invoice)
+    #    We used "additional_data" when creating invoices.
+    #    Some examples use "custom", so support both.
     custom_raw = payload.get("custom") or payload.get("additional_data") or "{}"
+
     try:
         custom = json.loads(custom_raw)
     except Exception:
@@ -496,28 +512,17 @@ async def cryptomus_webhook(
     discord_id = custom.get("discord_id")
     plan = custom.get("plan")
 
-    print("WEBHOOK PARSED:", {
-        "status": status,
-        "discord_id": discord_id,
-        "plan": plan,
-    })
-
-    # 5) Only grant on successful statuses
-    if status not in ("paid", "paid_over"):
-        # log but don't error out
-        return {"ok": True, "message": f"Ignored status {status}"}
-
     if not discord_id or not plan:
-        raise HTTPException(status_code=400, detail="Missing discord_id or plan in custom/additional_data")
+        raise HTTPException(
+            status_code=400,
+            detail="Missing discord_id or plan in webhook data",
+        )
 
-    # 6) Call your shared JSON writer from subscriptions.py
-    # invoice_id: use uuid if present, otherwise order_id as a fallback
-    invoice_id = payload.get("uuid") or payload.get("order_id") or "cryptomus"
-
+    # 4) Actually grant subscription in our JSON
     try:
-        add_subscription(int(discord_id), plan, invoice_id)
+        grant_subscription_from_webhook(int(discord_id), plan, payload)
     except Exception as e:
-        print("ERROR in add_subscription from webhook:", e)
+        print("ERROR in grant_subscription_from_webhook:", e)
         raise HTTPException(status_code=500, detail="Failed to grant subscription")
 
     return {"ok": True, "message": f"Subscription granted for {discord_id} ({plan})"}
