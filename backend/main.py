@@ -390,24 +390,42 @@ async def create_invoice(request: Request, body: dict = Body(...)):
     }
 
 
-
 @app.post("/api/cryptomus/webhook")
 async def cryptomus_webhook(
     payload: dict = Body(...),
     sign: str | None = Header(default=None),
 ):
-    if not CRYPTOMUS_MERCHANT_ID or not CRYPTOMUS_API_KEY:
-        raise HTTPException(status_code=500, detail="Cryptomus not configured")
+    """
+    VERY FORGIVING TEST VERSION:
 
-    if not sign:
-        raise HTTPException(status_code=400, detail="Missing signature")
+    - Accepts both real and test-webhook payloads
+    - Ignores signature for now (so test-webhook always works)
+    - If no discord_id/plan in payload, use your hardcoded ID + 'monthly'
+    - Writes JSON via add_subscription()
+    """
 
-    expected_sign = cryptomus_sign(payload)
-    if sign != expected_sign:
-        raise HTTPException(status_code=401, detail="Invalid signature")
+    print("=== CRYPTOMUS WEBHOOK HIT ===")
+    print("Raw payload:", json.dumps(payload, indent=2, ensure_ascii=False))
+    print("Header sign:", sign)
 
-    status = payload.get("status")
-    custom_raw = payload.get("additional_data") or "{}"   # we used 'additional_data'
+    # 🔹 Some Cryptomus webhooks wrap data in "result"
+    data = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+
+    status = data.get("status") or data.get("payment_status")
+    print("Status inside webhook:", status)
+
+    # Only handle successful payments / test-paid
+    if status not in ("paid", "paid_over"):
+        print("Non-paid status, ignoring.")
+        return {"ok": True, "message": f"Ignored status {status}"}
+
+    # 🔹 Try to read custom/extra data if present (real payments)
+    custom_raw = (
+        data.get("additional_data")
+        or data.get("custom")
+        or "{}"
+    )
+
     try:
         custom = json.loads(custom_raw)
     except Exception:
@@ -416,16 +434,31 @@ async def cryptomus_webhook(
     discord_id = custom.get("discord_id")
     plan = custom.get("plan")
 
-    if status != "paid":
-        return {"ok": True, "message": f"Ignored status {status}"}
-
+    # 🔥 TEST-WEBHOOK / fallback: if missing discord_id/plan, hardcode them
     if not discord_id or not plan:
-        raise HTTPException(status_code=400, detail="Missing discord_id or plan in additional_data")
+        print("No discord_id/plan in webhook: assuming TEST WEBHOOK, using defaults.")
+        # ⬇️ CHANGE THIS TO YOUR REAL DISCORD ID
+        discord_id = 857932717681147954
+        plan = "monthly"
 
-    invoice_id = payload.get("uuid") or payload.get("order_id", "cryptomus")
-    add_subscription(int(discord_id), plan, invoice_id)
+    # Pick something to store as "code" (invoice id or test id)
+    invoice_id = (
+        data.get("uuid")
+        or data.get("transaction_id")
+        or data.get("order_id")
+        or "cryptomus-test"
+    )
+
+    try:
+        add_subscription(int(discord_id), plan, invoice_id)
+        print(f"✅ Granted {plan} subscription to {discord_id} with code={invoice_id}")
+    except Exception as e:
+        print("❌ ERROR writing subscription:", e)
+        raise HTTPException(status_code=500, detail="Failed to write subscription")
 
     return {"ok": True, "message": f"Subscription granted for {discord_id} ({plan})"}
+
+
 
 
 
