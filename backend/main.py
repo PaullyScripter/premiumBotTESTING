@@ -28,10 +28,15 @@ if not DISCORD_CLIENT_ID or not DISCORD_CLIENT_SECRET or not DISCORD_REDIRECT_UR
 
 app = FastAPI()
 
+FRONTEND_ORIGINS = [
+    "http://localhost:5500",              # local dev
+    "https://YOUR-SITE.netlify.app",      # replace with your real Netlify URL
+]
+
 # allow your Netlify site to talk to this backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # later restrict to your Netlify URL
+    allow_origins=FRONTEND_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -130,12 +135,14 @@ async def discord_callback(code: str | None = None, error: str | None = None):
     sessions[session_id] = user
 
     response = RedirectResponse(FRONTEND_URL)
+    IS_PROD = os.getenv("ENV", "dev") == "prod"
+
     response.set_cookie(
         "session_id",
         session_id,
         httponly=True,
-        secure=False,  # set True when using HTTPS in production
-        samesite="lax",
+        secure=IS_PROD,  # True on Render, False locally if you like
+        samesite="none" if IS_PROD else "lax",
         max_age=60 * 60 * 24 * 7,
     )
     return response
