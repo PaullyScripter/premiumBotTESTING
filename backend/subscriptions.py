@@ -113,14 +113,26 @@ def grant_subscription_from_webhook(user_id: int, plan: str, payload: Dict[str, 
     Called by the webhook once a payment is confirmed.
 
     plan: "monthly" / "yearly" / "lifetime"
-    payload: full Cryptomus webhook JSON (we use it just to store an invoice id).
+    payload: full Cryptomus webhook JSON.
     """
     tier = (plan or "").lower()
     if tier not in ("monthly", "yearly", "lifetime"):
         raise ValueError(f"Unknown plan type: {plan}")
 
-    # Use Cryptomus identifiers as the "code" field in your JSON
     invoice_id = payload.get("uuid") or payload.get("order_id") or "cryptomus"
 
     # Reuse your existing subscription logic
     add_subscription(user_id, tier, invoice_id)
+
+def grant_subscription_from_sellauth_webhook(user_id: int, plan: str, payload: Dict[str, Any]) -> None:
+    tier = (plan or "").lower()
+    if tier not in ("monthly", "yearly", "lifetime"):
+        raise ValueError(f"Unknown plan type: {plan}")
+
+    invoice_id = (
+        payload.get("id")
+        or payload.get("order_id")
+        or payload.get("invoice_id")
+        or "sellauth"
+    )
+    add_subscription(user_id, tier, str(invoice_id))
