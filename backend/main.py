@@ -266,8 +266,8 @@ async def discord_callback(code: str | None = None, error: str | None = None):
         "session_id",
         session_id,
         httponly=True,
-        secure=IS_PROD,  # True on Render, False locally if you like
-        samesite="none" if IS_PROD else "lax",
+        secure=True,        # ✅ ALWAYS true on Render
+        samesite="none",    # ✅ REQUIRED for cross-site
         max_age=60 * 60 * 24 * 7,
     )
     return response
@@ -281,7 +281,11 @@ async def logout(request: Request):
     if user:
         session_id = request.cookies.get("session_id")
         sessions.pop(session_id, None)
-        response.delete_cookie("session_id")
+        response.delete_cookie(
+            "session_id",
+            secure=True,
+            samesite="none",
+        )
     return response
 
 
@@ -564,3 +568,4 @@ async def cryptomus_webhook(
 @app.get("/")
 async def root():
     return {"ok": True}
+
