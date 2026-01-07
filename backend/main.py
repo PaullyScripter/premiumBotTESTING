@@ -76,6 +76,11 @@ app.add_middleware(
 
 sessions: dict[str, dict] = {}
 
+def safe_next(next_url: str) -> str:
+    if not next_url or not next_url.startswith("/"):
+        return "/"
+    return next_url
+
 
 def make_avatar_url(user: dict) -> str:
     avatar_hash = user.get("avatar")
@@ -196,33 +201,48 @@ def api_premium(discord_id: int):
     }
 
 @app.get("/auth/discord/login")
-async def discord_login():
-    """
-    Redirects the user to Discord's OAuth2 page.
-    """
+async def discord_login(next: str = "/"):
+    state = secrets.token_urlsafe(16)
+
+    # store state → next mapping
+    sessions[f"oauth_state:{state}"] = next
+
     params = {
         "client_id": DISCORD_CLIENT_ID,
         "redirect_uri": DISCORD_REDIRECT_URI,
         "response_type": "code",
         "scope": "identify",
+        "state": state,
     }
+
     url = "https://discord.com/api/oauth2/authorize?" + urlencode(params)
     return RedirectResponse(url)
 
 
+
 @app.get("/auth/discord/callback")
-async def discord_callback(code: str | None = None, error: str | None = None):
+async def discord_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+):
     """
-    Discord redirects here with ?code=...
-    We exchange it for a token, get the user, and create a simple session.
-    This version prints useful debug info instead of a generic 500 error.
+    Discord redirects here with ?code=...&state=...
+    We exchange it for a token, get the user, create a session,
+    then redirect back to the page user started login from.
     """
     if error:
-        # Discord sent an error like access_denied
         raise HTTPException(status_code=400, detail=f"Discord OAuth error: {error}")
 
     if not code:
         raise HTTPException(status_code=400, detail="Missing 'code' parameter")
+
+    if not state:
+        raise HTTPException(status_code=400, detail="Missing 'state' parameter")
+
+    # ✅ retrieve where the user wanted to go back to
+    next_url = sessions.pop(f"oauth_state:{state}", "/")
+    next_url = safe_next(next_url)
 
     token_url = "https://discord.com/api/oauth2/token"
     data = {
@@ -252,25 +272,27 @@ async def discord_callback(code: str | None = None, error: str | None = None):
             print("USER RESPONSE BODY:", user_res.text)
             user_res.raise_for_status()
             user = user_res.json()
+
     except httpx.HTTPError as e:
-        # show error clearly instead of generic 500
         raise HTTPException(status_code=500, detail=f"HTTP error talking to Discord: {e}")
 
     session_id = secrets.token_urlsafe(32)
     sessions[session_id] = user
 
-    response = RedirectResponse(FRONTEND_URL)
-    IS_PROD = os.getenv("ENV", "dev") == "prod"
+    # ✅ redirect back to where they started
+    response = RedirectResponse(next_url)
 
     response.set_cookie(
         "session_id",
         session_id,
         httponly=True,
-        secure=True,        # ✅ ALWAYS true on Render
-        samesite="none",    # ✅ REQUIRED for cross-site
+        secure=True,
+        # If you're using Netlify proxy (same-origin), Lax is best:
+        samesite="lax",
         max_age=60 * 60 * 24 * 7,
     )
     return response
+
 
 
 
@@ -568,4 +590,5 @@ async def cryptomus_webhook(
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
