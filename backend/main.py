@@ -26,6 +26,7 @@ from subscriptions import (
     grant_subscription_from_webhook,
     grant_subscription_from_sellauth_webhook
 )
+from urllib.parse import urlencode, urlparse
 from datetime import datetime, timedelta, timezone
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -92,10 +93,26 @@ app.add_middleware(
 
 sessions: dict[str, dict] = {}
 
-def safe_next(next_url: str) -> str:
-    if not next_url or not next_url.startswith("/"):
-        return "/"
-    return next_url
+
+def safe_next(next_url: str | None) -> str:
+    if not next_url:
+        return FRONTEND_URL
+
+    next_url = next_url.strip()
+
+    # Allow relative paths like "/premium.html"
+    if next_url.startswith("/"):
+        return next_url
+
+    # Allow absolute URLs ONLY to your frontend host
+    try:
+        u = urlparse(next_url)
+        if u.scheme in ("http", "https") and u.netloc in ALLOWED_FRONTEND_HOSTS:
+            return next_url
+    except Exception:
+        pass
+
+    return FRONTEND_URL
 
 
 def make_avatar_url(user: dict) -> str:
@@ -202,7 +219,33 @@ def cryptomus_verify_webhook_signature(raw_body: bytes, header_sign: str | None)
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     return payload
+    
+ALLOWED_FRONTEND_HOSTS = {"equinoxbot.netlify.app"}  # change if needed
 
+def safe_next_url(next_url: str | None) -> str:
+    if not next_url:
+        return FRONTEND_URL
+    try:
+        u = urlparse(next_url)
+        if u.scheme in ("http", "https") and u.netloc in ALLOWED_FRONTEND_HOSTS:
+            return next_url
+    except Exception:
+        pass
+    return FRONTEND_URL
+
+@app.get("/auth/discord/login")
+async def discord_login(next: str | None = Query(default=None)):
+    state = secrets.token_urlsafe(16)
+    sessions[f"oauth_state:{state}"] = next or FRONTEND_URL
+    params = {
+        "client_id": DISCORD_CLIENT_ID,
+        "redirect_uri": DISCORD_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "identify",
+        "state": safe_next_url(next),  # store return url in state
+    }
+    url = "https://discord.com/api/oauth2/authorize?" + urlencode(params)
+    return RedirectResponse(url)
 
 @app.get("/api/premium/{discord_id}")
 def api_premium(discord_id: int):
@@ -257,7 +300,7 @@ async def discord_callback(
         raise HTTPException(status_code=400, detail="Missing 'state' parameter")
 
     # ✅ retrieve where the user wanted to go back to
-    next_url = sessions.pop(f"oauth_state:{state}", "/")
+    next_url = sessions.pop(f"oauth_state:{state}", FRONTEND_URL)
     next_url = safe_next(next_url)
 
     token_url = "https://discord.com/api/oauth2/token"
@@ -310,6 +353,29 @@ async def discord_callback(
     return response
 
 
+@app.get("/api/subscription")
+def api_subscription(request: Request):
+    user = get_user_from_session(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not logged in")
+
+    discord_id = int(user["id"])
+
+    # You already have this:
+    active, tier, expires = user_is_active(discord_id)
+
+    # TODO: pull started_at + code_used from your Postgres tables
+    # Replace this with your real DB query:
+    started_at = None
+    code_used = None
+
+    return {
+        "premium": active,
+        "tier": tier,
+        "started_at": started_at,
+        "expires_at": expires,
+        "code_used": code_used,
+    }
 
 
 @app.post("/auth/logout")
@@ -679,6 +745,7 @@ def redeem_code(request: Request, body: dict = Body(...)):
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
