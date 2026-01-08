@@ -361,13 +361,37 @@ def api_subscription(request: Request):
 
     discord_id = int(user["id"])
 
-    # You already have this:
+    # Uses your existing premium logic
     active, tier, expires = user_is_active(discord_id)
 
-    # TODO: pull started_at + code_used from your Postgres tables
-    # Replace this with your real DB query:
+    # Defaults (until we query Postgres)
     started_at = None
     code_used = None
+
+    # If you are using Postgres for redeem-codes, query it here:
+    # (This expects your user_subscriptions table)
+    try:
+        import psycopg
+        db_url = os.getenv("DATABASE_URL")
+        if db_url:
+            with psycopg.connect(db_url, sslmode="require") as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        select tier, redeemed_at, expires_at, last_code_hash
+                        from user_subscriptions
+                        where discord_id = %s
+                        """,
+                        (discord_id,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        tier, started_at, expires, last_hash = row
+                        # Don't reveal full code hash; show last 8 chars as “code used”
+                        code_used = f"...{str(last_hash)[-8:]}"
+                        active = True if (tier == "lifetime" or expires is None or expires > datetime.now(timezone.utc)) else False
+    except Exception as e:
+        print("api_subscription db lookup failed:", e)
 
     return {
         "premium": active,
@@ -376,6 +400,7 @@ def api_subscription(request: Request):
         "expires_at": expires,
         "code_used": code_used,
     }
+
 
 
 @app.post("/auth/logout")
@@ -745,6 +770,7 @@ def redeem_code(request: Request, body: dict = Body(...)):
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
