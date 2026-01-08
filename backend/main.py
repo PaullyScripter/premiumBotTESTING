@@ -28,6 +28,7 @@ from subscriptions import (
 )
 from urllib.parse import urlencode, urlparse
 from datetime import datetime, timedelta, timezone
+import re 
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 REDEEM_CODE_PEPPER = os.getenv("REDEEM_CODE_PEPPER")
@@ -38,12 +39,10 @@ def get_db():
         raise RuntimeError("DATABASE_URL not set")
     return psycopg.connect(DATABASE_URL, sslmode="require")
 
-def normalize_code(code: str) -> str:
-    return code.replace("-", "").strip().upper()
+
 
 def hash_redeem_code(raw: str) -> str:
-    normalized = normalize_code(raw)
-    return hashlib.sha256((PEPPER + normalized).encode("utf-8")).hexdigest()
+    return hashlib.sha256((PEPPER + raw).encode("utf-8")).hexdigest()
 
 
 
@@ -679,7 +678,7 @@ async def cryptomus_webhook(
 
 #     return {"ok": True, "message": f"Subscription granted for {discord_id} ({plan})"}
 
-
+CODE_PATTERN = re.compile(r"^[A-Za-z0-9]{4}(-[A-Za-z0-9]{4}){3}$")
 @app.post("/api/redeem")
 def redeem_code(request: Request, body: dict = Body(...)):
     user = get_user_from_session(request)
@@ -688,42 +687,42 @@ def redeem_code(request: Request, body: dict = Body(...)):
 
     code = (body.get("code") or "").strip()
     if not code:
-        raise HTTPException(status_code=400, detail="Missing code")
+        raise HTTPException(status_code=400, detail="Redeem failed. Please try another code.")
 
-    def normalize_code(c: str) -> str:
-        return c.replace("-", "").strip().upper()
+    # ✅ STRICT format check (with dashes, case-sensitive)
+    if not CODE_PATTERN.fullmatch(code):
+        raise HTTPException(status_code=400, detail="Redeem failed. Please try another code.")
 
-    normalized = normalize_code(code)
-
-    discord_id = int(user["id"])
-    now = datetime.now(timezone.utc)
-
-    # hash with pepper sanity-check
     pepper = os.getenv("REDEEM_CODE_PEPPER")
     if not pepper:
         raise HTTPException(status_code=500, detail="Server misconfigured")
 
-    code_hash = hashlib.sha256((pepper + normalized).encode("utf-8")).hexdigest()
+    code_hash = hashlib.sha256((pepper + code).encode("utf-8")).hexdigest()
+    discord_id = int(user["id"])
+    now = datetime.now(timezone.utc)
 
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    select id, tier, used_at
-                    from redeem_codes
-                    where code_hash = %s
-                    for update
+                    SELECT id, tier, used_at
+                    FROM redeem_codes
+                    WHERE code_hash = %s
+                    FOR UPDATE
                     """,
                     (code_hash,),
                 )
                 row = cur.fetchone()
 
-                # ✅ generic failure (invalid OR used)
+                # ❌ invalid OR used → same response
                 if not row or row[2] is not None:
-                    raise HTTPException(status_code=400, detail="Redeem failed. Please try another code.")
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Redeem failed. Please try another code."
+                    )
 
-                code_id, tier, used_at = row
+                code_id, tier, _ = row
 
                 if tier == "monthly":
                     expires_at = now + timedelta(days=30)
@@ -733,27 +732,29 @@ def redeem_code(request: Request, body: dict = Body(...)):
                     expires_at = None
 
                 cur.execute(
-                    "update redeem_codes set used_at=%s, used_by_discord_id=%s where id=%s",
+                    "UPDATE redeem_codes SET used_at=%s, used_by_discord_id=%s WHERE id=%s",
                     (now, discord_id, code_id),
                 )
 
                 cur.execute(
                     """
-                    insert into redemptions (discord_id, tier, redeemed_at, expires_at, code_hash, code_id)
-                    values (%s, %s, %s, %s, %s, %s)
+                    INSERT INTO redemptions
+                    (discord_id, tier, redeemed_at, expires_at, code_hash, code_id)
+                    VALUES (%s, %s, %s, %s, %s, %s)
                     """,
                     (discord_id, tier, now, expires_at, code_hash, code_id),
                 )
 
                 cur.execute(
                     """
-                    insert into user_subscriptions (discord_id, tier, redeemed_at, expires_at, last_code_hash)
-                    values (%s, %s, %s, %s, %s)
-                    on conflict (discord_id) do update set
-                      tier = excluded.tier,
-                      redeemed_at = excluded.redeemed_at,
-                      expires_at = excluded.expires_at,
-                      last_code_hash = excluded.last_code_hash
+                    INSERT INTO user_subscriptions
+                    (discord_id, tier, redeemed_at, expires_at, last_code_hash)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (discord_id) DO UPDATE SET
+                      tier = EXCLUDED.tier,
+                      redeemed_at = EXCLUDED.redeemed_at,
+                      expires_at = EXCLUDED.expires_at,
+                      last_code_hash = EXCLUDED.last_code_hash
                     """,
                     (discord_id, tier, now, expires_at, code_hash),
                 )
@@ -771,9 +772,11 @@ def redeem_code(request: Request, body: dict = Body(...)):
 
 
 
+
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
