@@ -100,11 +100,11 @@ def safe_next(next_url: str | None) -> str:
 
     next_url = next_url.strip()
 
-    # Allow relative paths like "/premium.html"
+    # allow relative
     if next_url.startswith("/"):
         return next_url
 
-    # Allow absolute URLs ONLY to your frontend host
+    # allow absolute ONLY to your own frontend
     try:
         u = urlparse(next_url)
         if u.scheme in ("http", "https") and u.netloc in ALLOWED_FRONTEND_HOSTS:
@@ -114,6 +114,24 @@ def safe_next(next_url: str | None) -> str:
 
     return FRONTEND_URL
 
+@app.get("/auth/discord/login")
+async def discord_login(next: str | None = Query(default=None)):
+    # make a random state token
+    state = secrets.token_urlsafe(16)
+
+    # store where to go after login
+    sessions[f"oauth_state:{state}"] = safe_next(next)
+
+    params = {
+        "client_id": DISCORD_CLIENT_ID,
+        "redirect_uri": DISCORD_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "identify",
+        "state": state,  # ✅ MUST be the token
+    }
+
+    url = "https://discord.com/api/oauth2/authorize?" + urlencode(params)
+    return RedirectResponse(url)
 
 def make_avatar_url(user: dict) -> str:
     avatar_hash = user.get("avatar")
@@ -233,19 +251,6 @@ def safe_next_url(next_url: str | None) -> str:
         pass
     return FRONTEND_URL
 
-@app.get("/auth/discord/login")
-async def discord_login(next: str | None = Query(default=None)):
-    state = secrets.token_urlsafe(16)
-    sessions[f"oauth_state:{state}"] = next or FRONTEND_URL
-    params = {
-        "client_id": DISCORD_CLIENT_ID,
-        "redirect_uri": DISCORD_REDIRECT_URI,
-        "response_type": "code",
-        "scope": "identify",
-        "state": safe_next_url(next),  # store return url in state
-    }
-    url = "https://discord.com/api/oauth2/authorize?" + urlencode(params)
-    return RedirectResponse(url)
 
 @app.get("/api/premium/{discord_id}")
 def api_premium(discord_id: int):
@@ -258,24 +263,6 @@ def api_premium(discord_id: int):
         "tier": tier,
         "expires_at": expires,
     }
-
-@app.get("/auth/discord/login")
-async def discord_login(next: str = "/"):
-    state = secrets.token_urlsafe(16)
-
-    # store state → next mapping
-    sessions[f"oauth_state:{state}"] = next
-
-    params = {
-        "client_id": DISCORD_CLIENT_ID,
-        "redirect_uri": DISCORD_REDIRECT_URI,
-        "response_type": "code",
-        "scope": "identify",
-        "state": state,
-    }
-
-    url = "https://discord.com/api/oauth2/authorize?" + urlencode(params)
-    return RedirectResponse(url)
 
 
 
@@ -410,11 +397,7 @@ async def logout(request: Request):
     if user:
         session_id = request.cookies.get("session_id")
         sessions.pop(session_id, None)
-        response.delete_cookie(
-            "session_id",
-            secure=True,
-            samesite="none",
-        )
+        response.delete_cookie("session_id", secure=True, samesite="lax")
     return response
 
 
@@ -770,6 +753,7 @@ def redeem_code(request: Request, body: dict = Body(...)):
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
