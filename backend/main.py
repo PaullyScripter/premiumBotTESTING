@@ -665,39 +665,110 @@ async def cryptomus_webhook(
 
 CODE_PATTERN = re.compile(r"^[A-Za-z0-9]{4}(-[A-Za-z0-9]{4}){3}$")
 
+def lock_seconds_for_stage(stage: int) -> int:
+    base = 30
+    secs = base * (2 ** (stage - 1))  # 30,60,120,240...
+    return min(secs, 3600)
+
+def locked_response(retry_after: int):
+    # Your frontend notification can trigger off status 429 or locked=true
+    raise HTTPException(
+        status_code=429,
+        detail={
+            "message": "Temporarily locked from redeeming. Try again later.",
+            "locked": True,
+            "retry_after": retry_after,
+        },
+        headers={"Retry-After": str(retry_after)},
+    )
+
 @app.post("/api/redeem")
 def redeem_code(request: Request, body: dict = Body(...)):
     user = get_user_from_session(request)
     if not user:
         raise HTTPException(status_code=401, detail="Not logged in")
 
-    code = (body.get("code") or "").strip()
-    if not code:
-        raise HTTPException(status_code=400, detail="Redeem failed. Please try another code.")
-    
-    # Accept either dashed OR 16 raw chars, keep case exactly
-    if "-" not in code:
-        # user sent raw 16 chars (case-sensitive preserved)
-        if not re.fullmatch(r"^[A-Za-z0-9]{16}$", code):
-            raise HTTPException(status_code=400, detail="Redeem failed. Please try another code.")
-        code = "-".join([code[i:i+4] for i in range(0, 16, 4)])
-    
-    # Now enforce dashed format strictly
-    if not CODE_PATTERN.fullmatch(code):
-        raise HTTPException(status_code=400, detail="Redeem failed. Please try another code.")
-
+    discord_id = int(user["id"])
+    now = datetime.now(timezone.utc)
 
     pepper = os.getenv("REDEEM_CODE_PEPPER")
     if not pepper:
         raise HTTPException(status_code=500, detail="Server misconfigured")
 
-    code_hash = hashlib.sha256((pepper + code).encode("utf-8")).hexdigest()
-    discord_id = int(user["id"])
-    now = datetime.now(timezone.utc)
+    code_input = (body.get("code") or "").strip()
 
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
+
+                # 1) Lock check (per discord_id), row-level locked
+                cur.execute(
+                    """
+                    INSERT INTO redeem_attempts (discord_id, fails, lock_until, updated_at)
+                    VALUES (%s, 0, NULL, %s)
+                    ON CONFLICT (discord_id) DO UPDATE SET updated_at = EXCLUDED.updated_at
+                    RETURNING fails, lock_until
+                    """,
+                    (discord_id, now),
+                )
+                fails, lock_until = cur.fetchone()
+
+                if lock_until and lock_until > now:
+                    retry_after = int((lock_until - now).total_seconds())
+                    conn.commit()
+                    locked_response(retry_after)
+
+                # Helper to record a failure (and possibly lock), then return the standard failure
+                def record_fail_and_raise():
+                    nonlocal fails
+                    fails += 1
+
+                    new_lock_until = None
+                    retry_after = None
+                    locked_now = False
+
+                    if fails % 3 == 0:
+                        stage = fails // 3
+                        lock_secs = lock_seconds_for_stage(stage)
+                        new_lock_until = now + timedelta(seconds=lock_secs)
+                        retry_after = lock_secs
+                        locked_now = True
+
+                    cur.execute(
+                        """
+                        UPDATE redeem_attempts
+                        SET fails=%s, lock_until=%s, updated_at=%s
+                        WHERE discord_id=%s
+                        """,
+                        (fails, new_lock_until, now, discord_id),
+                    )
+                    conn.commit()
+
+                    # If we just locked them, return the lock response so your notification fires
+                    if locked_now:
+                        locked_response(retry_after)
+
+                    # Otherwise generic failure (don’t reveal whether code exists/used)
+                    raise HTTPException(status_code=400, detail="Redeem failed. Please try another code.")
+
+                # 2) Validate code input (count invalid formats as failures too)
+                if not code_input:
+                    record_fail_and_raise()
+
+                code = code_input
+
+                # Accept either dashed OR 16 raw chars, keep case exactly
+                if "-" not in code:
+                    if not re.fullmatch(r"^[A-Za-z0-9]{16}$", code):
+                        record_fail_and_raise()
+                    code = "-".join([code[i:i+4] for i in range(0, 16, 4)])
+
+                if not CODE_PATTERN.fullmatch(code):
+                    record_fail_and_raise()
+
+                code_hash = hashlib.sha256((pepper + code).encode("utf-8")).hexdigest()
+
+                # 3) Redeem flow (atomic + no info leak), but DO NOT raise before updating attempts
                 cur.execute(
                     """
                     SELECT id, tier, used_at
@@ -709,14 +780,10 @@ def redeem_code(request: Request, body: dict = Body(...)):
                 )
                 row = cur.fetchone()
 
-                # ❌ invalid OR used → same response
-                if not row or row[2] is not None:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Redeem failed. Please try another code."
-                    )
+                if (not row) or (row[2] is not None):
+                    record_fail_and_raise()
 
-                code_id, tier, _ = row
+                code_id, tier, _used_at = row
 
                 if tier == "monthly":
                     expires_at = now + timedelta(days=30)
@@ -753,6 +820,16 @@ def redeem_code(request: Request, body: dict = Body(...)):
                     (discord_id, tier, now, expires_at, code_hash),
                 )
 
+                # 4) Success: reset attempts
+                cur.execute(
+                    """
+                    UPDATE redeem_attempts
+                    SET fails=0, lock_until=NULL, updated_at=%s
+                    WHERE discord_id=%s
+                    """,
+                    (now, discord_id),
+                )
+
             conn.commit()
 
     except HTTPException:
@@ -764,12 +841,10 @@ def redeem_code(request: Request, body: dict = Body(...)):
     return {"ok": True, "tier": tier, "expires_at": expires_at}
 
 
-
-
-
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
