@@ -1,7 +1,7 @@
 import os
 import secrets
 from urllib.parse import urlencode
-
+import psycopg
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse
 from pydantic import BaseModel
@@ -26,6 +26,22 @@ from subscriptions import (
     grant_subscription_from_webhook,
     grant_subscription_from_sellauth_webhook
 )
+from datetime import datetime, timedelta, timezone
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+REDEEM_CODE_PEPPER = os.getenv("REDEEM_CODE_PEPPER")
+
+
+def get_db():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL not set")
+    return psycopg.connect(DATABASE_URL, sslmode="require")
+
+def hash_redeem_code(raw: str) -> str:
+    if not REDEEM_CODE_PEPPER:
+        raise RuntimeError("REDEEM_CODE_PEPPER not set")
+    raw = raw.strip()
+    return hashlib.sha256((REDEEM_CODE_PEPPER + raw).encode("utf-8")).hexdigest()
 
 
 # Always load the .env that lives in the same folder as main.py
@@ -583,12 +599,86 @@ async def cryptomus_webhook(
 #     return {"ok": True, "message": f"Subscription granted for {discord_id} ({plan})"}
 
 
+@app.post("/api/redeem")
+def redeem_code(request: Request, body: dict = Body(...)):
+    user = get_user_from_session(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not logged in")
 
+    code = (body.get("code") or "").strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing code")
+
+    discord_id = int(user["id"])
+    code_hash = hash_redeem_code(code)
+    now = datetime.now(timezone.utc)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            # lock the code row (prevents double redeem)
+            cur.execute(
+                """
+                select id, tier, used_at
+                from redeem_codes
+                where code_hash = %s
+                for update
+                """,
+                (code_hash,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=400, detail="Invalid code")
+
+            code_id, tier, used_at = row
+            if used_at is not None:
+                raise HTTPException(status_code=400, detail="Code already used")
+
+            # expiration by tier
+            if tier == "monthly":
+                expires_at = now + timedelta(days=30)
+            elif tier == "yearly":
+                expires_at = now + timedelta(days=365)
+            else:
+                expires_at = None  # lifetime
+
+            # mark used
+            cur.execute(
+                "update redeem_codes set used_at=%s, used_by_discord_id=%s where id=%s",
+                (now, discord_id, code_id),
+            )
+
+            # audit log
+            cur.execute(
+                """
+                insert into redemptions (discord_id, tier, redeemed_at, expires_at, code_hash, code_id)
+                values (%s, %s, %s, %s, %s, %s)
+                """,
+                (discord_id, tier, now, expires_at, code_hash, code_id),
+            )
+
+            # current subscription snapshot
+            cur.execute(
+                """
+                insert into user_subscriptions (discord_id, tier, redeemed_at, expires_at, last_code_hash)
+                values (%s, %s, %s, %s, %s)
+                on conflict (discord_id) do update set
+                  tier = excluded.tier,
+                  redeemed_at = excluded.redeemed_at,
+                  expires_at = excluded.expires_at,
+                  last_code_hash = excluded.last_code_hash
+                """,
+                (discord_id, tier, now, expires_at, code_hash),
+            )
+
+        conn.commit()
+
+    return {"ok": True, "tier": tier, "expires_at": expires_at}
 
 
 
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
