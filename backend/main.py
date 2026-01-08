@@ -42,10 +42,6 @@ def get_db():
 
 
 
-def hash_redeem_code(raw: str) -> str:
-    return hashlib.sha256((PEPPER + raw).encode("utf-8")).hexdigest()
-
-
 
 
 
@@ -240,16 +236,6 @@ def cryptomus_verify_webhook_signature(raw_body: bytes, header_sign: str | None)
     
 ALLOWED_FRONTEND_HOSTS = {"equinoxbot.netlify.app"}  # change if needed
 
-def safe_next_url(next_url: str | None) -> str:
-    if not next_url:
-        return FRONTEND_URL
-    try:
-        u = urlparse(next_url)
-        if u.scheme in ("http", "https") and u.netloc in ALLOWED_FRONTEND_HOSTS:
-            return next_url
-    except Exception:
-        pass
-    return FRONTEND_URL
 
 
 @app.get("/api/premium/{discord_id}")
@@ -784,6 +770,7 @@ def redeem_code(request: Request, body: dict = Body(...)):
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
