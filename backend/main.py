@@ -41,8 +41,8 @@ def get_db():
 def hash_redeem_code(raw: str) -> str:
     if not REDEEM_CODE_PEPPER:
         raise RuntimeError("REDEEM_CODE_PEPPER not set")
-    raw = raw.strip()
-    return hashlib.sha256((REDEEM_CODE_PEPPER + raw).encode("utf-8")).hexdigest()
+    normalized = raw.strip().replace("-", "").upper()
+    return hashlib.sha256((PEPPER + normalized).encode("utf-8")).hexdigest()
 
 
 # Always load the .env that lives in the same folder as main.py
@@ -753,6 +753,7 @@ def redeem_code(request: Request, body: dict = Body(...)):
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
