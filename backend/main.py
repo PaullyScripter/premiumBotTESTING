@@ -679,6 +679,7 @@ async def cryptomus_webhook(
 #     return {"ok": True, "message": f"Subscription granted for {discord_id} ({plan})"}
 
 CODE_PATTERN = re.compile(r"^[A-Za-z0-9]{4}(-[A-Za-z0-9]{4}){3}$")
+
 @app.post("/api/redeem")
 def redeem_code(request: Request, body: dict = Body(...)):
     user = get_user_from_session(request)
@@ -688,10 +689,18 @@ def redeem_code(request: Request, body: dict = Body(...)):
     code = (body.get("code") or "").strip()
     if not code:
         raise HTTPException(status_code=400, detail="Redeem failed. Please try another code.")
-
-    # ✅ STRICT format check (with dashes, case-sensitive)
+    
+    # Accept either dashed OR 16 raw chars, keep case exactly
+    if "-" not in code:
+        # user sent raw 16 chars (case-sensitive preserved)
+        if not re.fullmatch(r"^[A-Za-z0-9]{16}$", code):
+            raise HTTPException(status_code=400, detail="Redeem failed. Please try another code.")
+        code = "-".join([code[i:i+4] for i in range(0, 16, 4)])
+    
+    # Now enforce dashed format strictly
     if not CODE_PATTERN.fullmatch(code):
         raise HTTPException(status_code=400, detail="Redeem failed. Please try another code.")
+
 
     pepper = os.getenv("REDEEM_CODE_PEPPER")
     if not pepper:
@@ -776,6 +785,7 @@ def redeem_code(request: Request, body: dict = Body(...)):
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
