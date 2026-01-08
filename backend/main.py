@@ -1,4 +1,5 @@
 import os
+import asyncio
 import secrets
 from urllib.parse import urlencode
 import psycopg
@@ -815,13 +816,6 @@ def redeem_code(request: Request, body: dict = Body(...)):
 
                 code_id, tier, _used_at = row
 
-                if tier == "monthly":
-                    expires_at = now + timedelta(days=30)
-                elif tier == "yearly":
-                    expires_at = now + timedelta(days=365)
-                else:
-                    expires_at = None
-
                 cur.execute(
                     "UPDATE redeem_codes SET used_at=%s, used_by_discord_id=%s WHERE id=%s",
                     (now, discord_id, code_id),
@@ -833,8 +827,53 @@ def redeem_code(request: Request, body: dict = Body(...)):
                     (discord_id, tier, redeemed_at, expires_at, code_hash, code_id)
                     VALUES (%s, %s, %s, %s, %s, %s)
                     """,
-                    (discord_id, tier, now, expires_at, code_hash, code_id),
+                    (discord_id, tier, now, new_expires, code_hash, code_id),
                 )
+                # --- compute extended subscription ---
+                cur.execute(
+                    """
+                    SELECT tier, expires_at
+                    FROM user_subscriptions
+                    WHERE discord_id = %s
+                    FOR UPDATE
+                    """,
+                    (discord_id,),
+                )
+                sub_row = cur.fetchone()
+                
+                current_tier = sub_row[0] if sub_row else None
+                current_expires = sub_row[1] if sub_row else None
+                
+                # Normalize tz
+                if current_expires is not None and getattr(current_expires, "tzinfo", None) is None:
+                    current_expires = current_expires.replace(tzinfo=timezone.utc)
+                
+                # Extend from the later of now vs current expiry (so expired users extend from now)
+                base_time = now
+                if current_expires is not None and current_expires > now:
+                    base_time = current_expires
+                
+                # Decide new tier/expires
+                if tier == "lifetime":
+                    new_tier = "lifetime"
+                    new_expires = None
+                
+                elif current_tier == "lifetime":
+                    new_tier = "lifetime"
+                    new_expires = None
+                
+                elif tier == "monthly":
+                    new_tier = "monthly"
+                    new_expires = base_time + timedelta(days=30)
+                
+                elif tier == "yearly":
+                    new_tier = "yearly"
+                    new_expires = base_time + timedelta(days=365)
+                
+                else:
+                    # unknown tier: keep existing
+                    new_tier = current_tier
+                    new_expires = current_expires
 
                 cur.execute(
                     """
@@ -847,8 +886,9 @@ def redeem_code(request: Request, body: dict = Body(...)):
                       expires_at = EXCLUDED.expires_at,
                       last_code_hash = EXCLUDED.last_code_hash
                     """,
-                    (discord_id, tier, now, expires_at, code_hash),
+                    (discord_id, new_tier, now, new_expires, code_hash),
                 )
+
 
                 # 4) Success: reset attempts
                 cur.execute(
@@ -870,10 +910,37 @@ def redeem_code(request: Request, body: dict = Body(...)):
 
     return {"ok": True, "tier": tier, "expires_at": expires_at}
 
+async def prune_expired_subs_loop():
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        DELETE FROM user_subscriptions
+                        WHERE tier != 'lifetime'
+                          AND expires_at IS NOT NULL
+                          AND expires_at <= %s
+                        """,
+                        (now,),
+                    )
+                conn.commit()
+            print("[prune] expired subscriptions removed")
+        except Exception as e:
+            print("[prune] error:", repr(e))
+
+        # sleep 24h
+        await asyncio.sleep(60 * 60 * 24)
+
+@app.on_event("startup")
+async def startup_tasks():
+    asyncio.create_task(prune_expired_subs_loop())
 
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
