@@ -455,7 +455,7 @@ def api_premium_me(request: Request):
         raise HTTPException(status_code=401, detail="Not logged in")
 
     discord_id = int(user["id"])
-    active, tier, expires = user_is_active(discord_id)
+    active, tier, expires = db_user_is_active(discord_id)
 
     return {
         "premium": active,
@@ -621,78 +621,6 @@ async def cryptomus_webhook(
 
     print(f"WEBHOOK SUCCESSFULLY GRANTED {plan} TO {discord_id}")
     return {"ok": True, "message": f"Subscription granted for {discord_id} ({plan})"}
-# @app.post("/api/cryptomus/webhook")
-# async def cryptomus_webhook(
-#     payload: dict = Body(...),
-#     sign: str | None = Header(default=None),
-# ):
-#     """
-#     Secure Cryptomus webhook:
-
-#     - Verifies signature using payment API key
-#     - Only acts on 'paid' / 'paid_over'
-#     - Requires valid discord_id + plan in additional_data/custom
-#     - Writes subscription via add_subscription()
-#     """
-#     if not CRYPTOMUS_MERCHANT_ID or not CRYPTOMUS_API_KEY:
-#         raise HTTPException(status_code=500, detail="Cryptomus not configured")
-
-#     if not sign:
-#         raise HTTPException(status_code=400, detail="Missing signature header")
-
-#     # Some webhooks wrap data in "result"
-#     data = payload.get("result") if isinstance(payload.get("result"), dict) else payload
-
-#     # Verify signature
-#     expected_sign = cryptomus_sign(data)  # make sure this matches your helper
-#     if sign != expected_sign:
-#         print("❌ Invalid Cryptomus signature")
-#         raise HTTPException(status_code=401, detail="Invalid signature")
-
-#     print("=== CRYPTOMUS WEBHOOK (verified) ===")
-#     print(json.dumps(data, indent=2, ensure_ascii=False))
-
-#     status = data.get("status") or data.get("payment_status")
-#     if status not in ("paid", "paid_over"):
-#         print("Non-paid status, ignoring:", status)
-#         return {"ok": True, "message": f"Ignored status {status}"}
-
-#     # Read custom data (what you passed as additional_data/custom in /v1/payment)
-#     custom_raw = (
-#         data.get("additional_data")
-#         or data.get("custom")
-#         or "{}"
-#     )
-
-#     try:
-#         custom = json.loads(custom_raw)
-#     except Exception as e:
-#         print("Failed to parse additional_data/custom:", e, custom_raw)
-#         custom = {}
-
-#     discord_id = custom.get("discord_id")
-#     plan = custom.get("plan")
-
-#     if not discord_id or not plan:
-#         # For security, do NOT auto grant anything if these are missing
-#         print("Missing discord_id/plan in webhook custom data; ignoring.")
-#         return {"ok": True, "message": "Missing discord_id/plan; no subscription granted"}
-
-#     invoice_id = (
-#         data.get("uuid")
-#         or data.get("transaction_id")
-#         or data.get("order_id")
-#         or "cryptomus"
-#     )
-
-#     try:
-#         add_subscription(int(discord_id), plan, invoice_id)
-#         print(f"✅ Granted {plan} subscription to {discord_id} with code={invoice_id}")
-#     except Exception as e:
-#         print("❌ ERROR writing subscription:", e)
-#         raise HTTPException(status_code=500, detail="Failed to write subscription")
-
-#     return {"ok": True, "message": f"Subscription granted for {discord_id} ({plan})"}
 
 CODE_PATTERN = re.compile(r"^[A-Za-z0-9]{4}(-[A-Za-z0-9]{4}){3}$")
 
@@ -815,57 +743,8 @@ def redeem_code(request: Request, body: dict = Body(...)):
                     record_fail_and_raise()
 
                 code_id, tier, _used_at = row
-
-                cur.execute(
-                    "UPDATE redeem_codes SET used_at=%s, used_by_discord_id=%s WHERE id=%s",
-                    (now, discord_id, code_id),
-                )
-
-                sub_row = cur.fetchone()
                 
-                current_tier = sub_row[0] if sub_row else None
-                current_expires = sub_row[1] if sub_row else None
-                
-                # Normalize tz
-                if current_expires is not None and getattr(current_expires, "tzinfo", None) is None:
-                    current_expires = current_expires.replace(tzinfo=timezone.utc)
-                
-                # Extend from the later of now vs current expiry (so expired users extend from now)
-                base_time = now
-                if current_expires is not None and current_expires > now:
-                    base_time = current_expires
-                
-                # Decide new tier/expires
-                if tier == "lifetime":
-                    new_tier = "lifetime"
-                    new_expires = None
-                
-                elif current_tier == "lifetime":
-                    new_tier = "lifetime"
-                    new_expires = None
-                
-                elif tier == "monthly":
-                    new_tier = "monthly"
-                    new_expires = base_time + timedelta(days=30)
-                
-                elif tier == "yearly":
-                    new_tier = "yearly"
-                    new_expires = base_time + timedelta(days=365)
-                
-                else:
-                    # unknown tier: keep existing
-                    new_tier = current_tier
-                    new_expires = current_expires
-                
-                cur.execute(
-                    """
-                    INSERT INTO redemptions
-                    (discord_id, tier, redeemed_at, expires_at, code_hash, code_id)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    """,
-                    (discord_id, tier, now, new_expires, code_hash, code_id),
-                )
-                # --- compute extended subscription ---
+                # --- get current subscription (must be BEFORE computing new_expires) ---
                 cur.execute(
                     """
                     SELECT tier, expires_at
@@ -875,7 +754,51 @@ def redeem_code(request: Request, body: dict = Body(...)):
                     """,
                     (discord_id,),
                 )
-
+                sub_row = cur.fetchone()
+                
+                current_tier = sub_row[0] if sub_row else None
+                current_expires = sub_row[1] if sub_row else None
+                
+                if current_expires is not None and getattr(current_expires, "tzinfo", None) is None:
+                    current_expires = current_expires.replace(tzinfo=timezone.utc)
+                
+                base_time = now
+                if current_expires is not None and current_expires > now:
+                    base_time = current_expires
+                
+                if tier == "lifetime":
+                    new_tier = "lifetime"
+                    new_expires = None
+                elif current_tier == "lifetime":
+                    new_tier = "lifetime"
+                    new_expires = None
+                elif tier == "monthly":
+                    new_tier = "monthly"
+                    new_expires = base_time + timedelta(days=30)
+                elif tier == "yearly":
+                    new_tier = "yearly"
+                    new_expires = base_time + timedelta(days=365)
+                else:
+                    new_tier = current_tier
+                    new_expires = current_expires
+                
+                # mark code used
+                cur.execute(
+                    "UPDATE redeem_codes SET used_at=%s, used_by_discord_id=%s WHERE id=%s",
+                    (now, discord_id, code_id),
+                )
+                
+                # log redemption (store resulting expiry)
+                cur.execute(
+                    """
+                    INSERT INTO redemptions
+                    (discord_id, tier, redeemed_at, expires_at, code_hash, code_id)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (discord_id, tier, now, new_expires, code_hash, code_id),
+                )
+                
+                # upsert subscription
                 cur.execute(
                     """
                     INSERT INTO user_subscriptions
@@ -889,6 +812,7 @@ def redeem_code(request: Request, body: dict = Body(...)):
                     """,
                     (discord_id, new_tier, now, new_expires, code_hash),
                 )
+
 
 
                 # 4) Success: reset attempts
@@ -909,7 +833,7 @@ def redeem_code(request: Request, body: dict = Body(...)):
         print("REDEEM ERROR:", repr(e))
         raise HTTPException(status_code=500, detail="Internal server error")
 
-    return {"ok": True, "tier": tier, "expires_at": new_expires}
+    return {"ok": True, "tier": new_tier, "expires_at": new_expires}
 
 async def prune_expired_subs_loop():
     while True:
@@ -941,6 +865,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
