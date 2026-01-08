@@ -41,6 +41,36 @@ def get_db():
     return psycopg.connect(DATABASE_URL, sslmode="require")
 
 
+def db_user_is_active(discord_id: int):
+    now = datetime.now(timezone.utc)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT tier, expires_at
+                FROM user_subscriptions
+                WHERE discord_id = %s
+                ORDER BY redeemed_at DESC
+                LIMIT 1
+                """,
+                (discord_id,),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return False, None, None
+
+    tier, expires = row
+
+    # normalize tz
+    if expires is not None and getattr(expires, "tzinfo", None) is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+
+    if tier == "lifetime" or expires is None:
+        return True, tier, None
+
+    return (expires > now), tier, expires
 
 
 
@@ -243,7 +273,7 @@ def api_premium(discord_id: int):
     """
     Bot and frontend can call this to see if a user is premium.
     """
-    active, tier, expires = user_is_active(discord_id)
+    active, tier, expires = db_user_is_active(discord_id)
     return {
         "premium": active,
         "tier": tier,
@@ -400,7 +430,7 @@ def me(request: Request):
 
     # Discord user data from OAuth
     discord_id = int(user["id"])
-    active, tier, expires = user_is_active(discord_id)
+    active, tier, expires = db_user_is_active(discord_id)
 
     return {
         "id": discord_id,
@@ -844,6 +874,7 @@ def redeem_code(request: Request, body: dict = Body(...)):
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
