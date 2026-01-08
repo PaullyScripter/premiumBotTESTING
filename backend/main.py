@@ -29,6 +29,7 @@ from subscriptions import (
 from urllib.parse import urlencode, urlparse
 from datetime import datetime, timedelta, timezone
 import re 
+BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 DATABASE_URL = os.getenv("DATABASE_URL")
 REDEEM_CODE_PEPPER = os.getenv("REDEEM_CODE_PEPPER")
@@ -46,8 +47,6 @@ def hash_redeem_code(raw: str) -> str:
 
 
 
-# Always load the .env that lives in the same folder as main.py
-BASE_DIR = Path(__file__).resolve().parent
 
 
 DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
@@ -785,6 +784,7 @@ def redeem_code(request: Request, body: dict = Body(...)):
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
