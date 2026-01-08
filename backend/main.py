@@ -365,7 +365,7 @@ def api_subscription(request: Request):
 
     discord_id = int(user["id"])
 
-    active, tier, expires = user_is_active(discord_id)
+    active, tier, expires = db_user_is_active(discord_id)
 
     started_at = None
     code_used = None
@@ -821,24 +821,6 @@ def redeem_code(request: Request, body: dict = Body(...)):
                     (now, discord_id, code_id),
                 )
 
-                cur.execute(
-                    """
-                    INSERT INTO redemptions
-                    (discord_id, tier, redeemed_at, expires_at, code_hash, code_id)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    """,
-                    (discord_id, tier, now, new_expires, code_hash, code_id),
-                )
-                # --- compute extended subscription ---
-                cur.execute(
-                    """
-                    SELECT tier, expires_at
-                    FROM user_subscriptions
-                    WHERE discord_id = %s
-                    FOR UPDATE
-                    """,
-                    (discord_id,),
-                )
                 sub_row = cur.fetchone()
                 
                 current_tier = sub_row[0] if sub_row else None
@@ -874,6 +856,25 @@ def redeem_code(request: Request, body: dict = Body(...)):
                     # unknown tier: keep existing
                     new_tier = current_tier
                     new_expires = current_expires
+                
+                cur.execute(
+                    """
+                    INSERT INTO redemptions
+                    (discord_id, tier, redeemed_at, expires_at, code_hash, code_id)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (discord_id, tier, now, new_expires, code_hash, code_id),
+                )
+                # --- compute extended subscription ---
+                cur.execute(
+                    """
+                    SELECT tier, expires_at
+                    FROM user_subscriptions
+                    WHERE discord_id = %s
+                    FOR UPDATE
+                    """,
+                    (discord_id,),
+                )
 
                 cur.execute(
                     """
@@ -908,7 +909,7 @@ def redeem_code(request: Request, body: dict = Body(...)):
         print("REDEEM ERROR:", repr(e))
         raise HTTPException(status_code=500, detail="Internal server error")
 
-    return {"ok": True, "tier": tier, "expires_at": expires_at}
+    return {"ok": True, "tier": tier, "expires_at": new_expires}
 
 async def prune_expired_subs_loop():
     while True:
@@ -940,6 +941,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
