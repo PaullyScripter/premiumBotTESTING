@@ -38,11 +38,13 @@ def get_db():
         raise RuntimeError("DATABASE_URL not set")
     return psycopg.connect(DATABASE_URL, sslmode="require")
 
+def normalize_code(code: str) -> str:
+    return code.replace("-", "").strip().upper()
+
 def hash_redeem_code(raw: str) -> str:
-    if not REDEEM_CODE_PEPPER:
-        raise RuntimeError("REDEEM_CODE_PEPPER not set")
-    normalized = raw.strip().replace("-", "").upper()
+    normalized = normalize_code(raw)
     return hashlib.sha256((PEPPER + normalized).encode("utf-8")).hexdigest()
+
 
 
 # Always load the .env that lives in the same folder as main.py
@@ -348,15 +350,11 @@ def api_subscription(request: Request):
 
     discord_id = int(user["id"])
 
-    # Uses your existing premium logic
     active, tier, expires = user_is_active(discord_id)
 
-    # Defaults (until we query Postgres)
     started_at = None
     code_used = None
 
-    # If you are using Postgres for redeem-codes, query it here:
-    # (This expects your user_subscriptions table)
     try:
         import psycopg
         db_url = os.getenv("DATABASE_URL")
@@ -368,15 +366,24 @@ def api_subscription(request: Request):
                         select tier, redeemed_at, expires_at, last_code_hash
                         from user_subscriptions
                         where discord_id = %s
+                        order by redeemed_at desc
+                        limit 1
                         """,
                         (discord_id,),
                     )
                     row = cur.fetchone()
                     if row:
                         tier, started_at, expires, last_hash = row
-                        # Don't reveal full code hash; show last 8 chars as “code used”
-                        code_used = f"...{str(last_hash)[-8:]}"
-                        active = True if (tier == "lifetime" or expires is None or expires > datetime.now(timezone.utc)) else False
+                        code_used = f"...{str(last_hash)[-8:]}" if last_hash else None
+
+                        now = datetime.now(timezone.utc)
+                        if tier == "lifetime" or expires is None:
+                            active = True
+                        else:
+                            # make expires timezone-aware if needed
+                            if getattr(expires, "tzinfo", None) is None:
+                                expires = expires.replace(tzinfo=timezone.utc)
+                            active = expires > now
     except Exception as e:
         print("api_subscription db lookup failed:", e)
 
@@ -683,76 +690,91 @@ def redeem_code(request: Request, body: dict = Body(...)):
     if not code:
         raise HTTPException(status_code=400, detail="Missing code")
 
+    def normalize_code(c: str) -> str:
+        return c.replace("-", "").strip().upper()
+
+    normalized = normalize_code(code)
+
     discord_id = int(user["id"])
-    code_hash = hash_redeem_code(code)
     now = datetime.now(timezone.utc)
 
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            # lock the code row (prevents double redeem)
-            cur.execute(
-                """
-                select id, tier, used_at
-                from redeem_codes
-                where code_hash = %s
-                for update
-                """,
-                (code_hash,),
-            )
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(status_code=400, detail="Invalid code")
+    # hash with pepper sanity-check
+    pepper = os.getenv("REDEEM_CODE_PEPPER")
+    if not pepper:
+        raise HTTPException(status_code=500, detail="Server misconfigured")
 
-            code_id, tier, used_at = row
-            if used_at is not None:
-                raise HTTPException(status_code=400, detail="Code already used")
+    code_hash = hashlib.sha256((pepper + normalized).encode("utf-8")).hexdigest()
 
-            # expiration by tier
-            if tier == "monthly":
-                expires_at = now + timedelta(days=30)
-            elif tier == "yearly":
-                expires_at = now + timedelta(days=365)
-            else:
-                expires_at = None  # lifetime
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    select id, tier, used_at
+                    from redeem_codes
+                    where code_hash = %s
+                    for update
+                    """,
+                    (code_hash,),
+                )
+                row = cur.fetchone()
 
-            # mark used
-            cur.execute(
-                "update redeem_codes set used_at=%s, used_by_discord_id=%s where id=%s",
-                (now, discord_id, code_id),
-            )
+                # ✅ generic failure (invalid OR used)
+                if not row or row[2] is not None:
+                    raise HTTPException(status_code=400, detail="Redeem failed. Please try another code.")
 
-            # audit log
-            cur.execute(
-                """
-                insert into redemptions (discord_id, tier, redeemed_at, expires_at, code_hash, code_id)
-                values (%s, %s, %s, %s, %s, %s)
-                """,
-                (discord_id, tier, now, expires_at, code_hash, code_id),
-            )
+                code_id, tier, used_at = row
 
-            # current subscription snapshot
-            cur.execute(
-                """
-                insert into user_subscriptions (discord_id, tier, redeemed_at, expires_at, last_code_hash)
-                values (%s, %s, %s, %s, %s)
-                on conflict (discord_id) do update set
-                  tier = excluded.tier,
-                  redeemed_at = excluded.redeemed_at,
-                  expires_at = excluded.expires_at,
-                  last_code_hash = excluded.last_code_hash
-                """,
-                (discord_id, tier, now, expires_at, code_hash),
-            )
+                if tier == "monthly":
+                    expires_at = now + timedelta(days=30)
+                elif tier == "yearly":
+                    expires_at = now + timedelta(days=365)
+                else:
+                    expires_at = None
 
-        conn.commit()
+                cur.execute(
+                    "update redeem_codes set used_at=%s, used_by_discord_id=%s where id=%s",
+                    (now, discord_id, code_id),
+                )
+
+                cur.execute(
+                    """
+                    insert into redemptions (discord_id, tier, redeemed_at, expires_at, code_hash, code_id)
+                    values (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (discord_id, tier, now, expires_at, code_hash, code_id),
+                )
+
+                cur.execute(
+                    """
+                    insert into user_subscriptions (discord_id, tier, redeemed_at, expires_at, last_code_hash)
+                    values (%s, %s, %s, %s, %s)
+                    on conflict (discord_id) do update set
+                      tier = excluded.tier,
+                      redeemed_at = excluded.redeemed_at,
+                      expires_at = excluded.expires_at,
+                      last_code_hash = excluded.last_code_hash
+                    """,
+                    (discord_id, tier, now, expires_at, code_hash),
+                )
+
+            conn.commit()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("REDEEM ERROR:", repr(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
     return {"ok": True, "tier": tier, "expires_at": expires_at}
+
 
 
 
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
