@@ -667,7 +667,7 @@ def redeem_code(request: Request, body: dict = Body(...)):
     if not user:
         raise HTTPException(status_code=401, detail="Not logged in")
 
-    discord_id = str(user["id"])
+    discord_id = int(user["id"])  # ✅ int for DB
     now = datetime.now(timezone.utc)
 
     pepper = os.getenv("REDEEM_CODE_PEPPER")
@@ -680,6 +680,7 @@ def redeem_code(request: Request, body: dict = Body(...)):
         with get_db() as conn:
             with conn.cursor() as cur:
 
+                # Ensure attempts row exists (supports admin_lock_until too)
                 cur.execute(
                     """
                     INSERT INTO redeem_attempts (discord_id, fails, lock_until, admin_lock_until, updated_at)
@@ -691,20 +692,19 @@ def redeem_code(request: Request, body: dict = Body(...)):
                 )
                 fails, lock_until, admin_lock_until = cur.fetchone()
 
+                # Effective lock = later of the two
                 effective_lock_until = None
                 if lock_until and lock_until > now:
                     effective_lock_until = lock_until
                 if admin_lock_until and admin_lock_until > now:
-                    if (effective_lock_until is None) or (admin_lock_until > effective_lock_until):
+                    if effective_lock_until is None or admin_lock_until > effective_lock_until:
                         effective_lock_until = admin_lock_until
-                
+
                 if effective_lock_until:
                     retry_after = int((effective_lock_until - now).total_seconds())
                     conn.commit()
                     locked_response(retry_after)
 
-
-                # Helper to record a failure (and possibly lock), then return the standard failure
                 def record_fail_and_raise():
                     nonlocal fails
                     fails += 1
@@ -730,20 +730,17 @@ def redeem_code(request: Request, body: dict = Body(...)):
                     )
                     conn.commit()
 
-                    # If we just locked them, return the lock response so your notification fires
                     if locked_now:
                         locked_response(retry_after)
 
-                    # Otherwise generic failure (don’t reveal whether code exists/used)
                     raise HTTPException(status_code=400, detail="Redeem failed. Please try another code.")
 
-                # 2) Validate code input (count invalid formats as failures too)
+                # Validate code input (invalid format counts as fail)
                 if not code_input:
                     record_fail_and_raise()
 
                 code = code_input
 
-                # Accept either dashed OR 16 raw chars, keep case exactly
                 if "-" not in code:
                     if not re.fullmatch(r"^[A-Za-z0-9]{16}$", code):
                         record_fail_and_raise()
@@ -754,7 +751,7 @@ def redeem_code(request: Request, body: dict = Body(...)):
 
                 code_hash = hashlib.sha256((pepper + code).encode("utf-8")).hexdigest()
 
-                # 3) Redeem flow (atomic + no info leak), but DO NOT raise before updating attempts
+                # Fetch code row locked
                 cur.execute(
                     """
                     SELECT id, tier, used_at
@@ -765,13 +762,12 @@ def redeem_code(request: Request, body: dict = Body(...)):
                     (code_hash,),
                 )
                 row = cur.fetchone()
-
                 if (not row) or (row[2] is not None):
                     record_fail_and_raise()
 
                 code_id, tier, _used_at = row
-                
-                # --- get current subscription (must be BEFORE computing new_expires) ---
+
+                # Lock current subscription row
                 cur.execute(
                     """
                     SELECT tier, expires_at
@@ -782,35 +778,36 @@ def redeem_code(request: Request, body: dict = Body(...)):
                     (discord_id,),
                 )
                 sub_row = cur.fetchone()
-                
                 current_tier = sub_row[0] if sub_row else None
                 current_expires = sub_row[1] if sub_row else None
-                
+
                 if current_expires is not None and getattr(current_expires, "tzinfo", None) is None:
                     current_expires = current_expires.replace(tzinfo=timezone.utc)
-                
+
                 base_time = now
                 if current_expires is not None and current_expires > now:
                     base_time = current_expires
-                
-                cur.execute("SELECT COUNT(DISTINCT tier) FROM redemptions WHERE discord_id=%s", (discord_id,))
-                distinct_tiers = cur.fetchone()[0] or 0
-                
-                if tier == "lifetime" or expires_at is None:
-                    display_tier = "lifetime"
-                elif distinct_tiers <= 1:
-                    display_tier = tier  # show tier if only one type redeemed ever
-                else:
-                    display_tier = humanize_remaining(expires_at, now)  # show generic time if mixed
 
-                
-                # mark code used
+                # Compute new tier/expiry (EXTEND logic)
+                if tier == "lifetime" or current_tier == "lifetime":
+                    new_tier = "lifetime"
+                    new_expires = None
+                elif tier == "monthly":
+                    new_tier = "monthly"
+                    new_expires = base_time + timedelta(days=30)
+                elif tier == "yearly":
+                    new_tier = "yearly"
+                    new_expires = base_time + timedelta(days=365)
+                else:
+                    raise HTTPException(status_code=500, detail="Invalid tier in DB")
+
+                # Mark code used
                 cur.execute(
                     "UPDATE redeem_codes SET used_at=%s, used_by_discord_id=%s WHERE id=%s",
                     (now, discord_id, code_id),
                 )
-                
-                # log redemption (store resulting expiry)
+
+                # Log redemption (store resulting expiry)
                 cur.execute(
                     """
                     INSERT INTO redemptions
@@ -819,8 +816,8 @@ def redeem_code(request: Request, body: dict = Body(...)):
                     """,
                     (discord_id, tier, now, new_expires, code_hash, code_id),
                 )
-                
-                # upsert subscription
+
+                # Upsert subscription
                 cur.execute(
                     """
                     INSERT INTO user_subscriptions
@@ -835,9 +832,7 @@ def redeem_code(request: Request, body: dict = Body(...)):
                     (discord_id, new_tier, now, new_expires, code_hash),
                 )
 
-
-
-                # 4) Success: reset attempts
+                # Success: reset attempts (also clear admin_lock? no—leave admin_lock as-is)
                 cur.execute(
                     """
                     UPDATE redeem_attempts
@@ -855,7 +850,8 @@ def redeem_code(request: Request, body: dict = Body(...)):
         print("REDEEM ERROR:", repr(e))
         raise HTTPException(status_code=500, detail="Internal server error")
 
-    return {"ok": True, "tier": new_tier, "expires_at": new_expires}
+    return {"ok": True, "tier": new_tier, "expires_at": new_expires, "discord_id": str(discord_id)}
+
 
 async def prune_expired_subs_loop():
     while True:
@@ -1342,6 +1338,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
