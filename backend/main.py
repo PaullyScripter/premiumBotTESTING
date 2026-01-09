@@ -1096,8 +1096,12 @@ def admin_revoke(request: Request, body: dict = Body(...)):
 @app.post("/api/admin/lock")
 def admin_lock(request: Request, body: dict = Body(...)):
     require_dev(request)
+
     discord_id = int(body.get("discord_id"))
     seconds = int(body.get("seconds"))
+
+    if seconds <= 0:
+        raise HTTPException(status_code=400, detail="Seconds must be > 0")
 
     now = datetime.now(timezone.utc)
     lock_until = now + timedelta(seconds=seconds)
@@ -1111,31 +1115,40 @@ def admin_lock(request: Request, body: dict = Body(...)):
                 ON CONFLICT (discord_id) DO UPDATE SET
                   lock_until = EXCLUDED.lock_until,
                   updated_at = EXCLUDED.updated_at
+                RETURNING discord_id, fails, lock_until, updated_at
                 """,
                 (discord_id, lock_until, now),
             )
+            row = cur.fetchone()
         conn.commit()
 
-    return {"ok": True, "discord_id": discord_id, "lock_until": lock_until}
+    return {
+        "ok": True,
+        "discord_id": row[0],
+        "fails": row[1],
+        "lock_until": row[2],
+        "updated_at": row[3],
+    }
+
 
 
 @app.post("/api/admin/unlock")
 def admin_unlock(request: Request, body: dict = Body(...)):
     require_dev(request)
+
     discord_id = int(body.get("discord_id"))
-    now = datetime.now(timezone.utc)
 
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                UPDATE redeem_attempts
-                SET fails=0, lock_until=NULL, updated_at=%s
-                WHERE discord_id=%s
-                """,
-                (now, discord_id),
+                "DELETE FROM redeem_attempts WHERE discord_id = %s",
+                (discord_id,),
             )
+            deleted = cur.rowcount
         conn.commit()
+
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="That user is not currently in redeem lockdown.")
 
     return {"ok": True}
 
@@ -1180,6 +1193,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
