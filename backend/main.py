@@ -660,22 +660,29 @@ def redeem_code(request: Request, body: dict = Body(...)):
         with get_db() as conn:
             with conn.cursor() as cur:
 
-                # 1) Lock check (per discord_id), row-level locked
                 cur.execute(
                     """
-                    INSERT INTO redeem_attempts (discord_id, fails, lock_until, updated_at)
-                    VALUES (%s, 0, NULL, %s)
+                    INSERT INTO redeem_attempts (discord_id, fails, lock_until, admin_lock_until, updated_at)
+                    VALUES (%s, 0, NULL, NULL, %s)
                     ON CONFLICT (discord_id) DO UPDATE SET updated_at = EXCLUDED.updated_at
-                    RETURNING fails, lock_until
+                    RETURNING fails, lock_until, admin_lock_until
                     """,
                     (discord_id, now),
                 )
-                fails, lock_until = cur.fetchone()
+                fails, lock_until, admin_lock_until = cur.fetchone()
 
+                effective_lock_until = None
                 if lock_until and lock_until > now:
-                    retry_after = int((lock_until - now).total_seconds())
+                    effective_lock_until = lock_until
+                if admin_lock_until and admin_lock_until > now:
+                    if (effective_lock_until is None) or (admin_lock_until > effective_lock_until):
+                        effective_lock_until = admin_lock_until
+                
+                if effective_lock_until:
+                    retry_after = int((effective_lock_until - now).total_seconds())
                     conn.commit()
                     locked_response(retry_after)
+
 
                 # Helper to record a failure (and possibly lock), then return the standard failure
                 def record_fail_and_raise():
@@ -1099,25 +1106,24 @@ def admin_lock(request: Request, body: dict = Body(...)):
 
     discord_id = int(body.get("discord_id"))
     seconds = int(body.get("seconds"))
-
     if seconds <= 0:
         raise HTTPException(status_code=400, detail="Seconds must be > 0")
 
     now = datetime.now(timezone.utc)
-    lock_until = now + timedelta(seconds=seconds)
+    admin_lock_until = now + timedelta(seconds=seconds)
 
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO redeem_attempts (discord_id, fails, lock_until, updated_at)
-                VALUES (%s, 0, %s, %s)
+                INSERT INTO redeem_attempts (discord_id, fails, lock_until, admin_lock_until, updated_at)
+                VALUES (%s, 0, NULL, %s, %s)
                 ON CONFLICT (discord_id) DO UPDATE SET
-                  lock_until = EXCLUDED.lock_until,
+                  admin_lock_until = EXCLUDED.admin_lock_until,
                   updated_at = EXCLUDED.updated_at
-                RETURNING discord_id, fails, lock_until, updated_at
+                RETURNING discord_id, fails, lock_until, admin_lock_until, updated_at
                 """,
-                (discord_id, lock_until, now),
+                (discord_id, admin_lock_until, now),
             )
             row = cur.fetchone()
         conn.commit()
@@ -1127,30 +1133,43 @@ def admin_lock(request: Request, body: dict = Body(...)):
         "discord_id": row[0],
         "fails": row[1],
         "lock_until": row[2],
-        "updated_at": row[3],
+        "admin_lock_until": row[3],
+        "updated_at": row[4],
     }
-
-
 
 @app.post("/api/admin/unlock")
 def admin_unlock(request: Request, body: dict = Body(...)):
     require_dev(request)
-
     discord_id = int(body.get("discord_id"))
 
+    now = datetime.now(timezone.utc)
     with get_db() as conn:
         with conn.cursor() as cur:
+            # if no row OR admin lock not active -> error
             cur.execute(
-                "DELETE FROM redeem_attempts WHERE discord_id = %s",
+                """
+                SELECT admin_lock_until
+                FROM redeem_attempts
+                WHERE discord_id = %s
+                """,
                 (discord_id,),
             )
-            deleted = cur.rowcount
+            row = cur.fetchone()
+            if not row or row[0] is None:
+                raise HTTPException(status_code=404, detail="That user is not in admin lockdown.")
+
+            cur.execute(
+                """
+                UPDATE redeem_attempts
+                SET admin_lock_until = NULL, updated_at = %s
+                WHERE discord_id = %s
+                """,
+                (now, discord_id),
+            )
         conn.commit()
 
-    if deleted == 0:
-        raise HTTPException(status_code=404, detail="That user is not currently in redeem lockdown.")
-
     return {"ok": True}
+
 
 @app.get("/api/admin/redeem-locks")
 def admin_redeem_locks(request: Request):
@@ -1164,8 +1183,8 @@ def admin_redeem_locks(request: Request):
                 """
                 SELECT discord_id, fails, lock_until, updated_at
                 FROM redeem_attempts
-                WHERE lock_until IS NOT NULL
-                  AND lock_until > %s
+                WHERE (lock_until IS NOT NULL AND lock_until > %s)
+                   OR (admin_lock_until IS NOT NULL AND admin_lock_until > %s)
                 ORDER BY lock_until DESC
                 """,
                 (now,),
@@ -1193,6 +1212,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
