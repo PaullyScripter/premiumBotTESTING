@@ -1174,35 +1174,52 @@ def admin_unlock(request: Request, body: dict = Body(...)):
 @app.get("/api/admin/redeem-locks")
 def admin_redeem_locks(request: Request):
     require_dev(request)
-
     now = datetime.now(timezone.utc)
 
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT discord_id, fails, lock_until, updated_at
+                SELECT discord_id, fails, lock_until, admin_lock_until, updated_at
                 FROM redeem_attempts
                 WHERE (lock_until IS NOT NULL AND lock_until > %s)
                    OR (admin_lock_until IS NOT NULL AND admin_lock_until > %s)
-                ORDER BY lock_until DESC
+                ORDER BY GREATEST(
+                    COALESCE(lock_until, 'epoch'::timestamptz),
+                    COALESCE(admin_lock_until, 'epoch'::timestamptz)
+                ) DESC
                 """,
-                (now,),
+                (now, now),
             )
             rows = cur.fetchall()
 
-    return {
-        "ok": True,
-        "locks": [
-            {
-                "discord_id": int(r[0]),
-                "fails": int(r[1]),
-                "lock_until": r[2],
-                "updated_at": r[3],
-            }
-            for r in rows
-        ],
-    }
+    locks = []
+    for discord_id, fails, lock_until, admin_lock_until, updated_at in rows:
+        # effective lock = whichever ends later
+        effective = None
+        lock_type = None
+
+        if lock_until and lock_until > now:
+            effective = lock_until
+            lock_type = "bruteforce"
+
+        if admin_lock_until and admin_lock_until > now:
+            if effective is None or admin_lock_until > effective:
+                effective = admin_lock_until
+                lock_type = "admin"
+
+        locks.append({
+            "discord_id": int(discord_id),
+            "fails": int(fails),
+            "lock_until": lock_until,
+            "admin_lock_until": admin_lock_until,
+            "effective_lock_until": effective,
+            "lock_type": lock_type,
+            "updated_at": updated_at,
+        })
+
+    return {"ok": True, "locks": locks}
+
 
 
 @app.on_event("startup")
@@ -1212,6 +1229,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
