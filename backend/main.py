@@ -1139,6 +1139,39 @@ def admin_unlock(request: Request, body: dict = Body(...)):
 
     return {"ok": True}
 
+@app.get("/api/admin/redeem-locks")
+def admin_redeem_locks(request: Request):
+    require_dev(request)
+
+    now = datetime.now(timezone.utc)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT discord_id, fails, lock_until, updated_at
+                FROM redeem_attempts
+                WHERE lock_until IS NOT NULL
+                  AND lock_until > %s
+                ORDER BY lock_until DESC
+                """,
+                (now,),
+            )
+            rows = cur.fetchall()
+
+    return {
+        "ok": True,
+        "locks": [
+            {
+                "discord_id": int(r[0]),
+                "fails": int(r[1]),
+                "lock_until": r[2],
+                "updated_at": r[3],
+            }
+            for r in rows
+        ],
+    }
+
 
 @app.on_event("startup")
 async def startup_tasks():
@@ -1147,6 +1180,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
