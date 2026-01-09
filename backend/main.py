@@ -44,7 +44,7 @@ def get_db():
     return psycopg.connect(DATABASE_URL, sslmode="require")
 
 
-def db_user_is_active(discord_id: int):
+def db_user_is_active(discord_id: str):
     now = datetime.now(timezone.utc)
 
     with get_db() as conn:
@@ -270,7 +270,7 @@ ALLOWED_FRONTEND_HOSTS = {"equinoxbot.netlify.app"}  # change if needed
 
 
 @app.get("/api/premium/{discord_id}")
-def api_premium(discord_id: int):
+def api_premium(discord_id: str):
     """
     Bot and frontend can call this to see if a user is premium.
     """
@@ -363,7 +363,7 @@ def api_subscription(request: Request):
     if not user:
         raise HTTPException(status_code=401, detail="Not logged in")
 
-    discord_id = int(user["id"])
+    discord_id = str(user["id"])
 
     active, tier, expires = db_user_is_active(discord_id)
 
@@ -430,11 +430,11 @@ def me(request: Request):
         raise HTTPException(status_code=401, detail="Not logged in")
 
     # Discord user data from OAuth
-    discord_id = int(user["id"])
+    discord_id = str(user["id"])
     active, tier, expires = db_user_is_active(discord_id)
 
     return {
-        "id": discord_id,
+        "id": str(discord_id),
         "username": user["username"],
         "discriminator": user["discriminator"],
         "avatar": user["avatar"],
@@ -454,7 +454,7 @@ def api_premium_me(request: Request):
     if not user:
         raise HTTPException(status_code=401, detail="Not logged in")
 
-    discord_id = int(user["id"])
+    discord_id = str(user["id"])
     active, tier, expires = db_user_is_active(discord_id)
 
     return {
@@ -614,7 +614,7 @@ async def cryptomus_webhook(
 
     # 4) Grant subscription using your JSON-based logic
     try:
-        grant_subscription_from_webhook(int(discord_id), plan, payload)
+        grant_subscription_from_webhook(str(discord_id), plan, payload)
     except Exception as e:
         print("ERROR in grant_subscription_from_webhook:", e)
         raise HTTPException(status_code=500, detail="Failed to grant subscription")
@@ -647,7 +647,7 @@ def redeem_code(request: Request, body: dict = Body(...)):
     if not user:
         raise HTTPException(status_code=401, detail="Not logged in")
 
-    discord_id = int(user["id"])
+    discord_id = str(user["id"])
     now = datetime.now(timezone.utc)
 
     pepper = os.getenv("REDEEM_CODE_PEPPER")
@@ -865,13 +865,13 @@ async def prune_expired_subs_loop():
         # sleep 24h
         await asyncio.sleep(60 * 60 * 24)
 
-DEV_DISCORD_ID = 857932717681147954
+DEV_DISCORD_ID = "857932717681147954"
 
 def require_dev(request: Request) -> int:
     user = get_user_from_session(request)
     if not user:
         raise HTTPException(status_code=401, detail="Not logged in")
-    discord_id = int(user["id"])
+    discord_id = str(user["id"])
     if discord_id != DEV_DISCORD_ID:
         raise HTTPException(status_code=403, detail="Forbidden")
     return discord_id
@@ -1035,7 +1035,7 @@ def admin_premium_users(request: Request):
         "ok": True,
         "users": [
             {
-                "discord_id": r[0],
+                "discord_id": str(r[0]),
                 "tier": r[1],
                 "redeemed_at": r[2],
                 "expires_at": r[3],
@@ -1049,7 +1049,7 @@ def admin_premium_users(request: Request):
 def admin_grant(request: Request, body: dict = Body(...)):
     require_dev(request)
 
-    discord_id = int(body.get("discord_id"))
+    discord_id = str(body.get("discord_id"))
     tier = (body.get("tier") or "").lower()
     code_label = (body.get("code_used") or "MANUAL-GRANT").strip()
 
@@ -1118,7 +1118,7 @@ def admin_grant(request: Request, body: dict = Body(...)):
 @app.post("/api/admin/revoke")
 def admin_revoke(request: Request, body: dict = Body(...)):
     require_dev(request)
-    discord_id = int(body.get("discord_id"))
+    discord_id = str(body.get("discord_id"))
 
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -1136,7 +1136,7 @@ def admin_revoke(request: Request, body: dict = Body(...)):
 def admin_lock(request: Request, body: dict = Body(...)):
     require_dev(request)
 
-    discord_id = int(body.get("discord_id"))
+    discord_id = str(body.get("discord_id"))
     seconds = int(body.get("seconds"))
     if seconds <= 0:
         raise HTTPException(status_code=400, detail="Seconds must be > 0")
@@ -1172,7 +1172,7 @@ def admin_lock(request: Request, body: dict = Body(...)):
 @app.post("/api/admin/unlock")
 def admin_unlock(request: Request, body: dict = Body(...)):
     require_dev(request)
-    discord_id = int(body.get("discord_id"))
+    discord_id = str(body.get("discord_id"))
 
     now = datetime.now(timezone.utc)
     with get_db() as conn:
@@ -1261,6 +1261,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
