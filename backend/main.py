@@ -1072,6 +1072,33 @@ def admin_grant(request: Request, body: dict = Body(...)):
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
+                "SELECT tier, expires_at FROM user_subscriptions WHERE discord_id=%s FOR UPDATE",
+                (discord_id,),
+            )
+            sub = cur.fetchone()
+            current_tier = sub[0] if sub else None
+            current_expires = sub[1] if sub else None
+    
+            if current_expires is not None and getattr(current_expires, "tzinfo", None) is None:
+                current_expires = current_expires.replace(tzinfo=timezone.utc)
+    
+            base_time = now
+            if current_expires is not None and current_expires > now:
+                base_time = current_expires
+    
+            if tier == "lifetime" or current_tier == "lifetime":
+                new_tier = "lifetime"
+                new_expires = None
+            elif tier == "monthly":
+                new_tier = "monthly"
+                new_expires = base_time + timedelta(days=30)
+            elif tier == "yearly":
+                new_tier = "yearly"
+                new_expires = base_time + timedelta(days=365)
+            else:
+                raise HTTPException(400, "Invalid tier")
+    
+            cur.execute(
                 """
                 INSERT INTO user_subscriptions (discord_id, tier, redeemed_at, expires_at, last_code_hash)
                 VALUES (%s, %s, %s, %s, %s)
@@ -1081,11 +1108,12 @@ def admin_grant(request: Request, body: dict = Body(...)):
                   expires_at = EXCLUDED.expires_at,
                   last_code_hash = EXCLUDED.last_code_hash
                 """,
-                (discord_id, tier, now, expires, last_code_hash),
+                (discord_id, new_tier, now, new_expires, last_code_hash),
             )
         conn.commit()
+    
+    return {"ok": True, "discord_id": discord_id, "tier": new_tier, "expires_at": new_expires}
 
-    return {"ok": True, "discord_id": discord_id, "tier": tier, "expires_at": expires}
 
 @app.post("/api/admin/revoke")
 def admin_revoke(request: Request, body: dict = Body(...)):
@@ -1229,6 +1257,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
