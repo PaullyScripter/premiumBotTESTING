@@ -1126,7 +1126,11 @@ def admin_revoke(request: Request, body: dict = Body(...)):
             deleted = cur.rowcount
         conn.commit()
 
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="That user does not have an active subscription.")
+
     return {"ok": True, "deleted": deleted}
+
 
 @app.post("/api/admin/lock")
 def admin_lock(request: Request, body: dict = Body(...)):
@@ -1257,6 +1261,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
