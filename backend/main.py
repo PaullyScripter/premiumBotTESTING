@@ -267,6 +267,23 @@ def cryptomus_verify_webhook_signature(raw_body: bytes, header_sign: str | None)
     
 ALLOWED_FRONTEND_HOSTS = {"equinoxbot.netlify.app"}  # change if needed
 
+def humanize_remaining(expires_at: datetime, now: datetime) -> str:
+    secs = int((expires_at - now).total_seconds())
+    if secs <= 0:
+        return "expired"
+
+    days = secs // 86400
+    years = days // 365
+    days %= 365
+    months = days // 30
+    days %= 30
+
+    parts = []
+    if years: parts.append(f"{years} year" + ("s" if years != 1 else ""))
+    if months: parts.append(f"{months} month" + ("s" if months != 1 else ""))
+    if not parts:
+        parts.append(f"{max(1, days)} day" + ("s" if days != 1 else ""))
+    return " ".join(parts)
 
 
 @app.get("/api/premium/{discord_id}")
@@ -363,7 +380,7 @@ def api_subscription(request: Request):
     if not user:
         raise HTTPException(status_code=401, detail="Not logged in")
 
-    discord_id = str(user["id"])
+    discord_id = int(user["id"])  # ✅ int for DB
 
     active, tier, expires = db_user_is_active(discord_id)
 
@@ -371,34 +388,35 @@ def api_subscription(request: Request):
     code_used = None
 
     try:
-        import psycopg
         db_url = os.getenv("DATABASE_URL")
         if db_url:
             with psycopg.connect(db_url, sslmode="require") as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        select tier, redeemed_at, expires_at, last_code_hash
-                        from user_subscriptions
-                        where discord_id = %s
-                        order by redeemed_at desc
-                        limit 1
+                        SELECT tier, redeemed_at, expires_at, last_code_hash
+                        FROM user_subscriptions
+                        WHERE discord_id = %s
+                        ORDER BY redeemed_at DESC
+                        LIMIT 1
                         """,
                         (discord_id,),
                     )
                     row = cur.fetchone()
-                    if row:
-                        tier, started_at, expires, last_hash = row
-                        code_used = f"...{str(last_hash)[-8:]}" if last_hash else None
 
-                        now = datetime.now(timezone.utc)
-                        if tier == "lifetime" or expires is None:
-                            active = True
-                        else:
-                            # make expires timezone-aware if needed
-                            if getattr(expires, "tzinfo", None) is None:
-                                expires = expires.replace(tzinfo=timezone.utc)
-                            active = expires > now
+            if row:
+                tier, started_at, expires, last_hash = row
+                code_used = f"...{str(last_hash)[-8:]}" if last_hash else None
+
+                now = datetime.now(timezone.utc)
+
+                if tier == "lifetime" or expires is None:
+                    active = True
+                else:
+                    if getattr(expires, "tzinfo", None) is None:
+                        expires = expires.replace(tzinfo=timezone.utc)
+                    active = expires > now
+
     except Exception as e:
         print("api_subscription db lookup failed:", e)
 
@@ -408,7 +426,9 @@ def api_subscription(request: Request):
         "started_at": started_at,
         "expires_at": expires,
         "code_used": code_used,
+        "discord_id": str(discord_id),  # ✅ string for frontend display
     }
+
 
 
 
@@ -773,21 +793,16 @@ def redeem_code(request: Request, body: dict = Body(...)):
                 if current_expires is not None and current_expires > now:
                     base_time = current_expires
                 
-                if tier == "lifetime":
-                    new_tier = "lifetime"
-                    new_expires = None
-                elif current_tier == "lifetime":
-                    new_tier = "lifetime"
-                    new_expires = None
-                elif tier == "monthly":
-                    new_tier = "monthly"
-                    new_expires = base_time + timedelta(days=30)
-                elif tier == "yearly":
-                    new_tier = "yearly"
-                    new_expires = base_time + timedelta(days=365)
+                cur.execute("SELECT COUNT(DISTINCT tier) FROM redemptions WHERE discord_id=%s", (discord_id,))
+                distinct_tiers = cur.fetchone()[0] or 0
+                
+                if tier == "lifetime" or expires_at is None:
+                    display_tier = "lifetime"
+                elif distinct_tiers <= 1:
+                    display_tier = tier  # show tier if only one type redeemed ever
                 else:
-                    new_tier = current_tier
-                    new_expires = current_expires
+                    display_tier = humanize_remaining(expires_at, now)  # show generic time if mixed
+
                 
                 # mark code used
                 cur.execute(
@@ -1114,6 +1129,72 @@ def admin_grant(request: Request, body: dict = Body(...)):
     
     return {"ok": True, "discord_id": discord_id, "tier": new_tier, "expires_at": new_expires}
 
+@app.post("/api/admin/reduce")
+def admin_reduce(request: Request, body: dict = Body(...)):
+    require_dev(request)
+
+    raw = str(body.get("discord_id") or "").strip()
+    tier = (body.get("tier") or "").lower().strip()
+
+    if not raw.isdigit():
+        raise HTTPException(status_code=400, detail="Invalid Discord ID")
+    discord_id = int(raw)
+
+    if tier not in ("monthly", "yearly", "lifetime"):
+        raise HTTPException(status_code=400, detail="Invalid tier")
+
+    now = datetime.now(timezone.utc)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT tier, expires_at
+                FROM user_subscriptions
+                WHERE discord_id = %s
+                FOR UPDATE
+                """,
+                (discord_id,),
+            )
+            row = cur.fetchone()
+
+            if not row:
+                raise HTTPException(status_code=404, detail="User has no active subscription.")
+
+            current_tier, current_expires = row
+
+            # lifetime (or null expires) means revoke on reduce
+            if current_tier == "lifetime" or current_expires is None or tier == "lifetime":
+                cur.execute("DELETE FROM user_subscriptions WHERE discord_id=%s", (discord_id,))
+                conn.commit()
+                return {"ok": True, "message": "Reduced lifetime -> revoked subscription."}
+
+            if getattr(current_expires, "tzinfo", None) is None:
+                current_expires = current_expires.replace(tzinfo=timezone.utc)
+
+            delta = timedelta(days=30) if tier == "monthly" else timedelta(days=365)
+
+            new_expires = current_expires - delta
+
+            # if reduction wipes remaining time => revoke
+            if new_expires <= now:
+                cur.execute("DELETE FROM user_subscriptions WHERE discord_id=%s", (discord_id,))
+                conn.commit()
+                return {"ok": True, "message": "Reduction exceeded remaining time -> revoked subscription."}
+
+            # keep tier as-is; just reduce expiry
+            cur.execute(
+                """
+                UPDATE user_subscriptions
+                SET expires_at=%s, redeemed_at=%s
+                WHERE discord_id=%s
+                """,
+                (new_expires, now, discord_id),
+            )
+        conn.commit()
+
+    return {"ok": True, "message": f"Reduced {tier} from subscription.", "expires_at": new_expires}
+
 
 @app.post("/api/admin/revoke")
 def admin_revoke(request: Request, body: dict = Body(...)):
@@ -1261,6 +1342,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
