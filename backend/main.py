@@ -30,6 +30,8 @@ from subscriptions import (
 from urllib.parse import urlencode, urlparse
 from datetime import datetime, timedelta, timezone
 import re 
+from fastapi import UploadFile, File
+
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -858,6 +860,288 @@ async def prune_expired_subs_loop():
         # sleep 24h
         await asyncio.sleep(60 * 60 * 24)
 
+DEV_DISCORD_ID = 857932717681147954
+
+def require_dev(request: Request) -> int:
+    user = get_user_from_session(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not logged in")
+    discord_id = int(user["id"])
+    if discord_id != DEV_DISCORD_ID:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return discord_id
+
+@app.post("/api/admin/import-codes")
+async def admin_import_codes(
+    request: Request,
+    tier: Literal["monthly", "yearly", "lifetime"] = Query(...),
+    file: UploadFile = File(...),
+):
+    require_dev(request)
+
+    pepper = os.getenv("REDEEM_CODE_PEPPER")
+    if not pepper:
+        raise HTTPException(status_code=500, detail="Server misconfigured")
+
+    content = (await file.read()).decode("utf-8", errors="ignore")
+    lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+
+    inserted = 0
+    skipped = 0
+    bad = 0
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            for raw in lines:
+                code = raw.strip()
+
+                # allow raw 16 -> dashed
+                if "-" not in code:
+                    if not re.fullmatch(r"^[A-Za-z0-9]{16}$", code):
+                        bad += 1
+                        continue
+                    code = "-".join([code[i:i+4] for i in range(0, 16, 4)])
+
+                if not CODE_PATTERN.fullmatch(code):
+                    bad += 1
+                    continue
+
+                code_hash = hashlib.sha256((pepper + code).encode("utf-8")).hexdigest()
+
+                cur.execute(
+                    """
+                    INSERT INTO redeem_codes (code_hash, tier)
+                    VALUES (%s, %s)
+                    ON CONFLICT (code_hash) DO NOTHING
+                    """,
+                    (code_hash, tier),
+                )
+                if cur.rowcount == 1:
+                    inserted += 1
+                else:
+                    skipped += 1
+
+        conn.commit()
+
+    return {"ok": True, "inserted": inserted, "skipped": skipped, "bad": bad}
+
+@app.post("/api/admin/codes/add")
+def admin_add_codes(request: Request, body: dict = Body(...)):
+    require_dev(request)
+
+    tier = (body.get("tier") or "").lower()
+    codes = body.get("codes") or []
+    if tier not in ("monthly", "yearly", "lifetime"):
+        raise HTTPException(400, "Invalid tier")
+
+    pepper = os.getenv("REDEEM_CODE_PEPPER")
+    if not pepper:
+        raise HTTPException(status_code=500, detail="Server misconfigured")
+
+    inserted = 0
+    skipped = 0
+    bad = 0
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            for raw in codes:
+                code = (raw or "").strip()
+                if not code:
+                    bad += 1
+                    continue
+
+                if "-" not in code:
+                    if not re.fullmatch(r"^[A-Za-z0-9]{16}$", code):
+                        bad += 1
+                        continue
+                    code = "-".join([code[i:i+4] for i in range(0, 16, 4)])
+
+                if not CODE_PATTERN.fullmatch(code):
+                    bad += 1
+                    continue
+
+                h = hashlib.sha256((pepper + code).encode("utf-8")).hexdigest()
+                cur.execute(
+                    """
+                    INSERT INTO redeem_codes (code_hash, tier)
+                    VALUES (%s, %s)
+                    ON CONFLICT (code_hash) DO NOTHING
+                    """,
+                    (h, tier),
+                )
+                if cur.rowcount == 1:
+                    inserted += 1
+                else:
+                    skipped += 1
+        conn.commit()
+
+    return {"ok": True, "inserted": inserted, "skipped": skipped, "bad": bad}
+
+@app.post("/api/admin/codes/remove")
+def admin_remove_code(request: Request, body: dict = Body(...)):
+    require_dev(request)
+
+    raw = (body.get("code") or "").strip()
+    if not raw:
+        raise HTTPException(400, "Missing code")
+
+    pepper = os.getenv("REDEEM_CODE_PEPPER")
+    if not pepper:
+        raise HTTPException(status_code=500, detail="Server misconfigured")
+
+    code = raw
+    if "-" not in code:
+        if not re.fullmatch(r"^[A-Za-z0-9]{16}$", code):
+            raise HTTPException(400, "Invalid code format")
+        code = "-".join([code[i:i+4] for i in range(0, 16, 4)])
+
+    if not CODE_PATTERN.fullmatch(code):
+        raise HTTPException(400, "Invalid code format")
+
+    h = hashlib.sha256((pepper + code).encode("utf-8")).hexdigest()
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM redeem_codes WHERE code_hash=%s AND used_at IS NULL", (h,))
+            deleted = cur.rowcount
+        conn.commit()
+
+    return {"ok": True, "deleted": deleted}
+
+@app.get("/api/admin/premium-users")
+def admin_premium_users(request: Request):
+    require_dev(request)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT discord_id, tier, redeemed_at, expires_at, last_code_hash
+                FROM user_subscriptions
+                ORDER BY redeemed_at DESC
+                """
+            )
+            rows = cur.fetchall()
+
+    def short_hash(h):
+        return None if not h else f"...{str(h)[-8:]}"
+
+    return {
+        "ok": True,
+        "users": [
+            {
+                "discord_id": r[0],
+                "tier": r[1],
+                "redeemed_at": r[2],
+                "expires_at": r[3],
+                "code_used": short_hash(r[4]),
+            }
+            for r in rows
+        ],
+    }
+
+@app.post("/api/admin/grant")
+def admin_grant(request: Request, body: dict = Body(...)):
+    require_dev(request)
+
+    discord_id = int(body.get("discord_id"))
+    tier = (body.get("tier") or "").lower()
+    code_label = (body.get("code_used") or "MANUAL-GRANT").strip()
+
+    if tier not in ("monthly", "yearly", "lifetime"):
+        raise HTTPException(400, "Invalid tier")
+
+    now = datetime.now(timezone.utc)
+
+    if tier == "lifetime":
+        expires = None
+    elif tier == "monthly":
+        expires = now + timedelta(days=30)
+    else:
+        expires = now + timedelta(days=365)
+
+    # store a "code hash" label so your UI shows code used
+    # (this does NOT need to be a real redeemable code)
+    last_code_hash = hashlib.sha256(("ADMIN:" + code_label).encode("utf-8")).hexdigest()
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO user_subscriptions (discord_id, tier, redeemed_at, expires_at, last_code_hash)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (discord_id) DO UPDATE SET
+                  tier = EXCLUDED.tier,
+                  redeemed_at = EXCLUDED.redeemed_at,
+                  expires_at = EXCLUDED.expires_at,
+                  last_code_hash = EXCLUDED.last_code_hash
+                """,
+                (discord_id, tier, now, expires, last_code_hash),
+            )
+        conn.commit()
+
+    return {"ok": True, "discord_id": discord_id, "tier": tier, "expires_at": expires}
+
+@app.post("/api/admin/revoke")
+def admin_revoke(request: Request, body: dict = Body(...)):
+    require_dev(request)
+    discord_id = int(body.get("discord_id"))
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM user_subscriptions WHERE discord_id=%s", (discord_id,))
+            deleted = cur.rowcount
+        conn.commit()
+
+    return {"ok": True, "deleted": deleted}
+
+@app.post("/api/admin/lock")
+def admin_lock(request: Request, body: dict = Body(...)):
+    require_dev(request)
+    discord_id = int(body.get("discord_id"))
+    seconds = int(body.get("seconds"))
+
+    now = datetime.now(timezone.utc)
+    lock_until = now + timedelta(seconds=seconds)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO redeem_attempts (discord_id, fails, lock_until, updated_at)
+                VALUES (%s, 0, %s, %s)
+                ON CONFLICT (discord_id) DO UPDATE SET
+                  lock_until = EXCLUDED.lock_until,
+                  updated_at = EXCLUDED.updated_at
+                """,
+                (discord_id, lock_until, now),
+            )
+        conn.commit()
+
+    return {"ok": True, "discord_id": discord_id, "lock_until": lock_until}
+
+
+@app.post("/api/admin/unlock")
+def admin_unlock(request: Request, body: dict = Body(...)):
+    require_dev(request)
+    discord_id = int(body.get("discord_id"))
+    now = datetime.now(timezone.utc)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE redeem_attempts
+                SET fails=0, lock_until=NULL, updated_at=%s
+                WHERE discord_id=%s
+                """,
+                (now, discord_id),
+            )
+        conn.commit()
+
+    return {"ok": True}
+
+
 @app.on_event("startup")
 async def startup_tasks():
     asyncio.create_task(prune_expired_subs_loop())
@@ -865,6 +1149,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
