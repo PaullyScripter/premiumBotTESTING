@@ -1209,13 +1209,13 @@ def admin_redeem_locks(request: Request):
                 lock_type = "admin"
 
         locks.append({
-            "discord_id": int(discord_id),
-            "fails": int(fails),
-            "lock_until": lock_until,
-            "admin_lock_until": admin_lock_until,
-            "effective_lock_until": effective,
-            "lock_type": lock_type,
-            "updated_at": updated_at,
+          "discord_id": str(discord_id),
+          "fails": int(fails),
+          "lock_until": lock_until,
+          "admin_lock_until": admin_lock_until,
+          "effective_lock_until": effective,
+          "lock_type": lock_type,
+          "updated_at": updated_at,
         })
 
     return {"ok": True, "locks": locks}
@@ -1229,6 +1229,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
