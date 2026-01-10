@@ -36,6 +36,8 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 DATABASE_URL = os.getenv("DATABASE_URL")
 REDEEM_CODE_PEPPER = os.getenv("REDEEM_CODE_PEPPER")
+DEV_ID = 857932717681147954
+pending_batches: dict[str, dict] = {}  # token -> {tier, codes, created_at}
 
 
 def get_db():
@@ -99,6 +101,15 @@ print("DEBUG DISCORD_REDIRECT_URI:", repr(DISCORD_REDIRECT_URI))
 
 if not DISCORD_CLIENT_ID or not DISCORD_CLIENT_SECRET or not DISCORD_REDIRECT_URI:
     print("⚠️ Set DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_REDIRECT_URI in .env")
+
+def cleanup_pending_batches():
+    now = datetime.now(timezone.utc)
+    expired = []
+    for token, batch in pending_batches.items():
+        if (now - batch["created_at"]) > timedelta(minutes=30):
+            expired.append(token)
+    for t in expired:
+        pending_batches.pop(t, None)
 
 
 app = FastAPI()
@@ -1329,6 +1340,84 @@ def admin_redeem_locks(request: Request):
 
     return {"ok": True, "locks": locks}
 
+@app.post("/api/admin/generate-codes")
+def admin_generate_codes(request: Request, body: dict = Body(...)):
+    require_dev(request)
+
+    tier = (body.get("tier") or "").lower().strip()
+    amount = int(body.get("amount") or 0)
+
+    if tier not in ("monthly", "yearly", "lifetime"):
+        raise HTTPException(400, detail="Invalid tier")
+    if amount <= 0 or amount > 50000:
+        raise HTTPException(400, detail="Invalid amount (1..50000)")
+
+    codes = [normalize_code(generate_code_raw()) for _ in range(amount)]
+
+    token = secrets.token_urlsafe(24)
+    pending_batches[token] = {
+        "tier": tier,
+        "codes": codes,
+        "created_at": datetime.now(timezone.utc),
+    }
+
+    return {
+        "ok": True,
+        "token": token,
+        "tier": tier,
+        "amount": amount,
+        "codes": codes,  # plaintext returned once
+    }
+
+@app.post("/api/admin/import-generated")
+def admin_import_generated(request: Request, body: dict = Body(...)):
+    require_dev(request)
+
+    token = (body.get("token") or "").strip()
+    if not token or token not in pending_batches:
+        raise HTTPException(400, detail="Invalid/expired batch token")
+
+    batch = pending_batches.pop(token)  # one-time use
+    tier = batch["tier"]
+    codes = batch["codes"]
+
+    pepper = os.getenv("REDEEM_CODE_PEPPER")
+    if not pepper:
+        raise HTTPException(500, detail="Server misconfigured")
+
+    inserted = 0
+    skipped = 0
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            for code in codes:
+                code_hash = hashlib.sha256((pepper + code).encode("utf-8")).hexdigest()
+                cur.execute(
+                    """
+                    INSERT INTO redeem_codes (code_hash, tier)
+                    VALUES (%s, %s)
+                    ON CONFLICT (code_hash) DO NOTHING
+                    """,
+                    (code_hash, tier),
+                )
+                if cur.rowcount == 1:
+                    inserted += 1
+                else:
+                    skipped += 1
+        conn.commit()
+
+    return {"ok": True, "tier": tier, "inserted": inserted, "skipped": skipped}
+
+@app.post("/api/admin/reject-generated")
+def admin_reject_generated(request: Request, body: dict = Body(...)):
+    require_dev(request)
+
+    token = (body.get("token") or "").strip()
+    if not token or token not in pending_batches:
+        raise HTTPException(400, detail="Invalid/expired batch token")
+
+    pending_batches.pop(token, None)
+    return {"ok": True}
 
 
 @app.on_event("startup")
@@ -1338,6 +1427,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
