@@ -1340,6 +1340,18 @@ def admin_redeem_locks(request: Request):
 
     return {"ok": True, "locks": locks}
 
+CODE_ALPHABET = "qwertyuiopasdfghjklzxcvbnmABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no confusing chars
+
+def generate_code_raw() -> str:
+    # 16 chars
+    return "".join(secrets.choice(CODE_ALPHABET) for _ in range(16))
+
+def normalize_code(raw: str) -> str:
+    raw = re.sub(r"[^A-Za-z0-9]", "", (raw or ""))
+    if len(raw) != 16:
+        raise ValueError("Generated code wrong length")
+    return "-".join(raw[i:i+4] for i in range(0, 16, 4))
+
 @app.post("/api/admin/generate-codes")
 def admin_generate_codes(request: Request, body: dict = Body(...)):
     require_dev(request)
@@ -1427,6 +1439,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
