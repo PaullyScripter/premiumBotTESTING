@@ -1043,7 +1043,7 @@ def admin_premium_users(request: Request):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT discord_id, tier, redeemed_at, expires_at, last_code_hash
+                SELECT discord_id::text, tier, redeemed_at, expires_at, last_code_hash
                 FROM user_subscriptions
                 ORDER BY redeemed_at DESC
                 """
@@ -1300,7 +1300,7 @@ def admin_redeem_locks(request: Request):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT discord_id, fails, lock_until, admin_lock_until, updated_at
+                SELECT discord_id::text, fails, lock_until, admin_lock_until, updated_at
                 FROM redeem_attempts
                 WHERE (lock_until IS NOT NULL AND lock_until > %s)
                    OR (admin_lock_until IS NOT NULL AND admin_lock_until > %s)
@@ -1427,6 +1427,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
