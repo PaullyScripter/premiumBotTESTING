@@ -695,7 +695,7 @@ def redeem_code(request: Request, body: dict = Body(...)):
                 # Ensure attempts row exists (supports admin_lock_until too)
                 cur.execute(
                     """
-                    INSERT INTO redeem_attempts (discord_id, fails, lock_until, admin_lock_until, updated_at)
+                    INSERT INTO public.redeem_attempts (discord_id, fails, lock_until, admin_lock_until, updated_at)
                     VALUES (%s, 0, NULL, NULL, %s)
                     ON CONFLICT (discord_id) DO UPDATE SET updated_at = EXCLUDED.updated_at
                     RETURNING fails, lock_until, admin_lock_until
@@ -734,7 +734,7 @@ def redeem_code(request: Request, body: dict = Body(...)):
 
                     cur.execute(
                         """
-                        UPDATE redeem_attempts
+                        UPDATE public.redeem_attempts
                         SET fails=%s, lock_until=%s, updated_at=%s
                         WHERE discord_id=%s
                         """,
@@ -848,7 +848,7 @@ def redeem_code(request: Request, body: dict = Body(...)):
                 # Success: reset attempts (also clear admin_lock? no—leave admin_lock as-is)
                 cur.execute(
                     """
-                    UPDATE redeem_attempts
+                    UPDATE public.redeem_attempts
                     SET fails=0, lock_until=NULL, updated_at=%s
                     WHERE discord_id=%s
                     """,
@@ -1241,7 +1241,7 @@ def admin_lock(request: Request, body: dict = Body(...)):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO redeem_attempts (discord_id, fails, lock_until, admin_lock_until, updated_at)
+                INSERT INTO public.redeem_attempts (discord_id, fails, lock_until, admin_lock_until, updated_at)
                 VALUES (%s, 0, NULL, %s, %s)
                 ON CONFLICT (discord_id) DO UPDATE SET
                   admin_lock_until = EXCLUDED.admin_lock_until,
@@ -1274,7 +1274,7 @@ def admin_unlock(request: Request, body: dict = Body(...)):
             cur.execute(
                 """
                 SELECT admin_lock_until
-                FROM redeem_attempts
+                FROM public.redeem_attempts
                 WHERE discord_id = %s
                 """,
                 (discord_id,),
@@ -1285,7 +1285,7 @@ def admin_unlock(request: Request, body: dict = Body(...)):
 
             cur.execute(
                 """
-                UPDATE redeem_attempts
+                UPDATE public.redeem_attempts
                 SET admin_lock_until = NULL, updated_at = %s
                 WHERE discord_id = %s
                 """,
@@ -1306,7 +1306,7 @@ def admin_redeem_locks(request: Request):
             cur.execute(
                 """
                 SELECT discord_id::text, fails, lock_until, admin_lock_until, updated_at
-                FROM redeem_attempts
+                FROM public.redeem_attempts
                 WHERE (lock_until IS NOT NULL AND lock_until > %s)
                    OR (admin_lock_until IS NOT NULL AND admin_lock_until > %s)
                 ORDER BY GREATEST(
@@ -1444,6 +1444,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
