@@ -54,7 +54,8 @@ def db_user_is_active(discord_id: str):
             cur.execute(
                 """
                 SELECT tier, expires_at
-                FROM user_subscriptions
+                FROM public.user_subscriptions
+
                 WHERE discord_id = %s
                 ORDER BY redeemed_at DESC
                 LIMIT 1
@@ -406,7 +407,7 @@ def api_subscription(request: Request):
                     cur.execute(
                         """
                         SELECT tier, redeemed_at, expires_at, last_code_hash
-                        FROM user_subscriptions
+                        FROM public.user_subscriptions
                         WHERE discord_id = %s
                         ORDER BY redeemed_at DESC
                         LIMIT 1
@@ -782,7 +783,8 @@ def redeem_code(request: Request, body: dict = Body(...)):
                 cur.execute(
                     """
                     SELECT tier, expires_at
-                    FROM user_subscriptions
+                    FROM public.user_subscriptions
+
                     WHERE discord_id = %s
                     FOR UPDATE
                     """,
@@ -872,7 +874,8 @@ async def prune_expired_subs_loop():
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        DELETE FROM user_subscriptions
+                        DELETE FROM public.user_subscriptions
+
                         WHERE tier != 'lifetime'
                           AND expires_at IS NOT NULL
                           AND expires_at <= %s
@@ -1044,7 +1047,8 @@ def admin_premium_users(request: Request):
             cur.execute(
                 """
                 SELECT discord_id::text, tier, redeemed_at, expires_at, last_code_hash
-                FROM user_subscriptions
+                FROM public.user_subscriptions
+
                 ORDER BY redeemed_at DESC
                 """
             )
@@ -1094,7 +1098,7 @@ def admin_grant(request: Request, body: dict = Body(...)):
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT tier, expires_at FROM user_subscriptions WHERE discord_id=%s FOR UPDATE",
+                "SELECT tier, expires_at FROM public.user_subscriptions WHERE discord_id=%s FOR UPDATE",
                 (discord_id,),
             )
             sub = cur.fetchone()
@@ -1157,7 +1161,8 @@ def admin_reduce(request: Request, body: dict = Body(...)):
             cur.execute(
                 """
                 SELECT tier, expires_at
-                FROM user_subscriptions
+                FROM public.user_subscriptions
+
                 WHERE discord_id = %s
                 FOR UPDATE
                 """,
@@ -1172,7 +1177,7 @@ def admin_reduce(request: Request, body: dict = Body(...)):
 
             # lifetime (or null expires) means revoke on reduce
             if current_tier == "lifetime" or current_expires is None or tier == "lifetime":
-                cur.execute("DELETE FROM user_subscriptions WHERE discord_id=%s", (discord_id,))
+                cur.execute("DELETE FROM public.user_subscriptions WHERE discord_id=%s", (discord_id,))
                 conn.commit()
                 return {"ok": True, "message": "Reduced lifetime -> revoked subscription."}
 
@@ -1185,7 +1190,7 @@ def admin_reduce(request: Request, body: dict = Body(...)):
 
             # if reduction wipes remaining time => revoke
             if new_expires <= now:
-                cur.execute("DELETE FROM user_subscriptions WHERE discord_id=%s", (discord_id,))
+                cur.execute("DELETE FROM public.user_subscriptions WHERE discord_id=%s", (discord_id,))
                 conn.commit()
                 return {"ok": True, "message": "Reduction exceeded remaining time -> revoked subscription."}
 
@@ -1210,7 +1215,7 @@ def admin_revoke(request: Request, body: dict = Body(...)):
 
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM user_subscriptions WHERE discord_id=%s", (discord_id,))
+            cur.execute("DELETE FROM public.user_subscriptions WHERE discord_id=%s", (discord_id,))
             deleted = cur.rowcount
         conn.commit()
 
@@ -1439,6 +1444,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
