@@ -140,7 +140,6 @@ def safe_next(next_url: str | None) -> str:
 
     next_url = next_url.strip()
 
-    # allow relative -> make absolute to frontend
     if next_url.startswith("/"):
         return FRONTEND_URL.rstrip("/") + next_url
 
@@ -152,6 +151,7 @@ def safe_next(next_url: str | None) -> str:
         pass
 
     return FRONTEND_URL
+
 
 
 @app.get("/auth/discord/login")
@@ -1472,6 +1472,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
