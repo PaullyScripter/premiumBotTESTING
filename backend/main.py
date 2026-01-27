@@ -131,7 +131,8 @@ app.add_middleware(
 )
 
 sessions: dict[str, dict] = {}
-
+used_oauth_states: set[str] = set()
+used_oauth_codes: set[str] = set()
 
 def safe_next(next_url: str | None) -> str:
     if not next_url:
@@ -139,11 +140,9 @@ def safe_next(next_url: str | None) -> str:
 
     next_url = next_url.strip()
 
-    # allow relative
     if next_url.startswith("/"):
-        return next_url
+        return FRONTEND_URL.rstrip("/") + next_url
 
-    # allow absolute ONLY to your own frontend
     try:
         u = urlparse(next_url)
         if u.scheme in ("http", "https") and u.netloc in ALLOWED_FRONTEND_HOSTS:
@@ -152,6 +151,8 @@ def safe_next(next_url: str | None) -> str:
         pass
 
     return FRONTEND_URL
+
+
 
 @app.get("/auth/discord/login")
 async def discord_login(next: str | None = Query(default=None)):
@@ -187,7 +188,21 @@ def get_user_from_session(request: Request) -> dict | None:
     session_id = request.cookies.get("session_id")
     if not session_id:
         return None
-    return sessions.get(session_id)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_json FROM public.web_sessions WHERE session_id = %s",
+                (session_id,),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return None
+
+    # row[0] may already be dict depending on driver; handle both
+    return row[0] if isinstance(row[0], dict) else json.loads(row[0])
+
 
 def cryptomus_sign(payload: dict) -> str:
     """
@@ -328,9 +343,16 @@ async def discord_callback(
 
     if not code:
         raise HTTPException(status_code=400, detail="Missing 'code' parameter")
-
+    if code in used_oauth_codes:
+        return RedirectResponse(FRONTEND_URL)
+    
+    used_oauth_codes.add(code)
     if not state:
         raise HTTPException(status_code=400, detail="Missing 'state' parameter")
+    if state in used_oauth_states:
+        return RedirectResponse(FRONTEND_URL)
+    
+    used_oauth_states.add(state)
 
     # ✅ retrieve where the user wanted to go back to
     next_url = sessions.pop(f"oauth_state:{state}", FRONTEND_URL)
@@ -349,11 +371,25 @@ async def discord_callback(
     try:
         async with httpx.AsyncClient() as client:
             token_res = await client.post(token_url, data=data, headers=headers, timeout=10)
+        
+            if token_res.status_code == 429:
+                retry_after = token_res.headers.get("Retry-After", "2")
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "message": "Rate limited by Discord. Try again shortly.",
+                        "retry_after": retry_after,
+                    },
+                    headers={"Retry-After": retry_after},
+                )
+        
             print("TOKEN RESPONSE STATUS:", token_res.status_code)
             print("TOKEN RESPONSE BODY:", token_res.text)
+        
             token_res.raise_for_status()
             token_data = token_res.json()
             access_token = token_data["access_token"]
+
 
             user_res = await client.get(
                 "https://discord.com/api/users/@me",
@@ -369,20 +405,29 @@ async def discord_callback(
         raise HTTPException(status_code=500, detail=f"HTTP error talking to Discord: {e}")
 
     session_id = secrets.token_urlsafe(32)
-    sessions[session_id] = user
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO public.web_sessions (session_id, user_json) VALUES (%s, %s)",
+                (session_id, json.dumps(user)),
+            )
+        conn.commit()
+
 
     # ✅ redirect back to where they started
     response = RedirectResponse(next_url)
 
+    is_prod = DISCORD_REDIRECT_URI.startswith("https://")
+    
     response.set_cookie(
-        "session_id",
-        session_id,
+        key="session_id",
+        value=session_id,
         httponly=True,
-        secure=True,
-        # If you're using Netlify proxy (same-origin), Lax is best:
-        samesite="lax",
+        secure=True,          # REQUIRED for SameSite=None
+        samesite="none",      # REQUIRED for cross-site (Netlify → API)
         max_age=60 * 60 * 24 * 7,
     )
+
     return response
 
 
@@ -450,8 +495,13 @@ async def logout(request: Request):
     response = JSONResponse({"ok": True})
     if user:
         session_id = request.cookies.get("session_id")
-        sessions.pop(session_id, None)
-        response.delete_cookie("session_id", secure=True, samesite="lax")
+        if session_id:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM public.web_sessions WHERE session_id = %s", (session_id,))
+                conn.commit()
+
+        response.delete_cookie("session_id", secure=True, samesite="none")
     return response
 
 
@@ -1444,37 +1494,4 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
