@@ -400,15 +400,17 @@ async def discord_callback(
     # ✅ redirect back to where they started
     response = RedirectResponse(next_url)
 
+    is_prod = DISCORD_REDIRECT_URI.startswith("https://")
+    
     response.set_cookie(
-        "session_id",
-        session_id,
+        key="session_id",
+        value=session_id,
         httponly=True,
-        secure=True,
-        # If you're using Netlify proxy (same-origin), Lax is best:
-        samesite="lax",
+        secure=True,          # REQUIRED for SameSite=None
+        samesite="none",      # REQUIRED for cross-site (Netlify → API)
         max_age=60 * 60 * 24 * 7,
     )
+
     return response
 
 
@@ -1470,6 +1472,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
