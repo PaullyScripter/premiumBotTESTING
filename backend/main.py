@@ -131,7 +131,8 @@ app.add_middleware(
 )
 
 sessions: dict[str, dict] = {}
-
+used_oauth_states: set[str] = set()
+used_oauth_codes: set[str] = set()
 
 def safe_next(next_url: str | None) -> str:
     if not next_url:
@@ -139,11 +140,10 @@ def safe_next(next_url: str | None) -> str:
 
     next_url = next_url.strip()
 
-    # allow relative
+    # allow relative -> make absolute to frontend
     if next_url.startswith("/"):
-        return next_url
+        return FRONTEND_URL.rstrip("/") + next_url
 
-    # allow absolute ONLY to your own frontend
     try:
         u = urlparse(next_url)
         if u.scheme in ("http", "https") and u.netloc in ALLOWED_FRONTEND_HOSTS:
@@ -152,6 +152,7 @@ def safe_next(next_url: str | None) -> str:
         pass
 
     return FRONTEND_URL
+
 
 @app.get("/auth/discord/login")
 async def discord_login(next: str | None = Query(default=None)):
@@ -328,9 +329,20 @@ async def discord_callback(
 
     if not code:
         raise HTTPException(status_code=400, detail="Missing 'code' parameter")
-
+    if code in used_oauth_codes:
+        return RedirectResponse(FRONTEND_URL)
+    
+    used_oauth_codes.add(code)
     if not state:
         raise HTTPException(status_code=400, detail="Missing 'state' parameter")
+    if state in used_oauth_states:
+        return RedirectResponse(FRONTEND_URL)
+    
+    used_oauth_states.add(state)
+    if state in used_oauth_states:
+        return RedirectResponse(FRONTEND_URL)  # already handled once
+    
+    used_oauth_states.add(state)
 
     # ✅ retrieve where the user wanted to go back to
     next_url = sessions.pop(f"oauth_state:{state}", FRONTEND_URL)
@@ -349,11 +361,25 @@ async def discord_callback(
     try:
         async with httpx.AsyncClient() as client:
             token_res = await client.post(token_url, data=data, headers=headers, timeout=10)
+        
+            if token_res.status_code == 429:
+                retry_after = token_res.headers.get("Retry-After", "2")
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "message": "Rate limited by Discord. Try again shortly.",
+                        "retry_after": retry_after,
+                    },
+                    headers={"Retry-After": retry_after},
+                )
+        
             print("TOKEN RESPONSE STATUS:", token_res.status_code)
             print("TOKEN RESPONSE BODY:", token_res.text)
+        
             token_res.raise_for_status()
             token_data = token_res.json()
             access_token = token_data["access_token"]
+
 
             user_res = await client.get(
                 "https://discord.com/api/users/@me",
@@ -1444,6 +1470,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
