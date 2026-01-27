@@ -131,8 +131,8 @@ app.add_middleware(
 )
 
 sessions: dict[str, dict] = {}
-used_oauth_states: set[str] = set()
-used_oauth_codes: set[str] = set()
+used_oauth_states: dict[str, datetime] = {}
+used_oauth_codes: dict[str, datetime] = {}
 
 def safe_next(next_url: str | None) -> str:
     if not next_url:
@@ -343,16 +343,28 @@ async def discord_callback(
 
     if not code:
         raise HTTPException(status_code=400, detail="Missing 'code' parameter")
-    if code in used_oauth_codes:
-        return RedirectResponse(FRONTEND_URL)
+    now = datetime.now(timezone.utc)
+        
+        # 1. Cleanup old entries to prevent memory leaks/endless rate limiting
+        # Remove anything older than 10 minutes
+        expiry_limit = now - timedelta(minutes=10)
+        for k in [k for k, v in used_oauth_codes.items() if v < expiry_limit]:
+            used_oauth_codes.pop(k, None)
+        for k in [k for k, v in used_oauth_states.items() if v < expiry_limit]:
+            used_oauth_states.pop(k, None)
     
-    used_oauth_codes.add(code)
-    if not state:
-        raise HTTPException(status_code=400, detail="Missing 'state' parameter")
-    if state in used_oauth_states:
-        return RedirectResponse(FRONTEND_URL)
+        # 2. Check if the current code/state was recently used
+        if code in used_oauth_codes:
+            print(f"DEBUG: Code {code} already used recently. Redirecting.")
+            return RedirectResponse(FRONTEND_URL)
+        
+        if not state or state in used_oauth_states:
+            print(f"DEBUG: State {state} invalid or already used. Redirecting.")
+            return RedirectResponse(FRONTEND_URL)
     
-    used_oauth_states.add(state)
+        # 3. Mark as used with a timestamp
+        used_oauth_codes[code] = now
+        used_oauth_states[state] = now
 
     # ✅ retrieve where the user wanted to go back to
     next_url = sessions.pop(f"oauth_state:{state}", FRONTEND_URL)
@@ -1494,4 +1506,5 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
