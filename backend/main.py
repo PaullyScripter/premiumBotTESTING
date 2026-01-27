@@ -188,7 +188,21 @@ def get_user_from_session(request: Request) -> dict | None:
     session_id = request.cookies.get("session_id")
     if not session_id:
         return None
-    return sessions.get(session_id)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_json FROM public.web_sessions WHERE session_id = %s",
+                (session_id,),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return None
+
+    # row[0] may already be dict depending on driver; handle both
+    return row[0] if isinstance(row[0], dict) else json.loads(row[0])
+
 
 def cryptomus_sign(payload: dict) -> str:
     """
@@ -481,7 +495,12 @@ async def logout(request: Request):
     response = JSONResponse({"ok": True})
     if user:
         session_id = request.cookies.get("session_id")
-        sessions.pop(session_id, None)
+        if session_id:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM public.web_sessions WHERE session_id = %s", (session_id,))
+                conn.commit()
+
         response.delete_cookie("session_id", secure=True, samesite="none")
     return response
 
@@ -1475,6 +1494,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
