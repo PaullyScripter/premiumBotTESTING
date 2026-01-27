@@ -391,7 +391,14 @@ async def discord_callback(
         raise HTTPException(status_code=500, detail=f"HTTP error talking to Discord: {e}")
 
     session_id = secrets.token_urlsafe(32)
-    sessions[session_id] = user
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO public.web_sessions (session_id, user_json) VALUES (%s, %s)",
+                (session_id, json.dumps(user)),
+            )
+        conn.commit()
+
 
     # ✅ redirect back to where they started
     response = RedirectResponse(next_url)
@@ -475,7 +482,7 @@ async def logout(request: Request):
     if user:
         session_id = request.cookies.get("session_id")
         sessions.pop(session_id, None)
-        response.delete_cookie("session_id", secure=True, samesite="lax")
+        response.delete_cookie("session_id", secure=True, samesite="none")
     return response
 
 
@@ -1468,6 +1475,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
