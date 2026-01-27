@@ -339,10 +339,6 @@ async def discord_callback(
         return RedirectResponse(FRONTEND_URL)
     
     used_oauth_states.add(state)
-    if state in used_oauth_states:
-        return RedirectResponse(FRONTEND_URL)  # already handled once
-    
-    used_oauth_states.add(state)
 
     # ✅ retrieve where the user wanted to go back to
     next_url = sessions.pop(f"oauth_state:{state}", FRONTEND_URL)
@@ -1472,6 +1468,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
