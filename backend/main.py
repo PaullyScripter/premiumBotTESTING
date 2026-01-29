@@ -32,6 +32,8 @@ from datetime import datetime, timedelta, timezone
 import re 
 from fastapi import UploadFile, File
 
+discord_rate_limited_until: datetime | None = None
+
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -152,6 +154,15 @@ def safe_next(next_url: str | None) -> str:
 
     return FRONTEND_URL
 
+now = datetime.now(timezone.utc)
+if discord_rate_limited_until and discord_rate_limited_until > now:
+    retry_secs = int((discord_rate_limited_until - now).total_seconds())
+    raise HTTPException(
+        status_code=429,
+        detail={"message": "Server temporarily rate-limited by Discord.", "retry_after": retry_secs},
+        headers={"Retry-After": str(retry_secs)},
+    )
+
 
 @app.get("/auth/discord/callback")
 async def discord_callback(
@@ -210,17 +221,30 @@ async def discord_callback(
             token_res = await client.post(token_url, data=data, headers=headers, timeout=10)
         
             if token_res.status_code == 429:
+                # read Retry-After in seconds (header may be missing)
+                retry_after_header = token_res.headers.get("Retry-After")
+                try:
+                    retry_after = int(retry_after_header) if retry_after_header else 60
+                except Exception:
+                    retry_after = 60
+            
+                # set global cooldown
+                discord_rate_limited_until = datetime.now(timezone.utc) + timedelta(seconds=retry_after)
+            
+                # clear ephemeral state so user can try again later
                 used_oauth_codes.pop(code, None)
                 used_oauth_states.pop(state, None)
-                retry_after = token_res.headers.get("Retry-After", "2")
+            
+                # surface a friendly message (and include Retry-After header)
                 raise HTTPException(
                     status_code=429,
                     detail={
                         "message": "Rate limited by Discord. Try again shortly.",
                         "retry_after": retry_after,
                     },
-                    headers={"Retry-After": retry_after},
+                    headers={"Retry-After": str(retry_after)},
                 )
+
         
             print("TOKEN RESPONSE STATUS:", token_res.status_code)
             print("TOKEN RESPONSE BODY:", token_res.text)
@@ -1629,6 +1653,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
