@@ -153,22 +153,19 @@ def safe_next(next_url: str | None) -> str:
     return FRONTEND_URL
 
 
-
 @app.get("/auth/discord/callback")
 async def discord_callback(code: str | None = None, state: str | None = None):
     if not code or not state:
         return RedirectResponse("/?error=missing_info")
 
-    # FIX 1: Define the state_key variable before using it
     state_key = f"oauth_state:{state}"
     
-    # FIX 2: Check if the state actually exists in sessions
     if state_key not in sessions:
         return RedirectResponse("/?error=invalid_state")
         
     next_url = sessions.pop(state_key, "/") 
 
-    # Mark as used locally to prevent immediate double-processing
+    # Prevent immediate double-processing
     used_oauth_codes[code] = datetime.now(timezone.utc)
 
     data = {
@@ -183,10 +180,10 @@ async def discord_callback(code: str | None = None, state: str | None = None):
 
     async with httpx.AsyncClient() as client:
         try:
+            # 1. Exchange Code for Token
             token_res = await client.post("https://discord.com/api/oauth2/token", data=data, headers=headers)
             
             if token_res.status_code == 429:
-                # Remove code from 'used' so user can retry after cooling down
                 used_oauth_codes.pop(code, None)
                 retry_after = token_res.json().get("retry_after", 5)
                 return JSONResponse(status_code=429, content={"detail": "Rate limited", "retry_after": retry_after})
@@ -195,8 +192,45 @@ async def discord_callback(code: str | None = None, state: str | None = None):
                 used_oauth_codes.pop(code, None)
                 return RedirectResponse("/?error=exchange_failed")
 
-            # ... rest of your logic for user info ...
-        except Exception:
+            token_data = token_res.json()
+            access_token = token_data.get("access_token")
+
+            # 2. Get User Profile from Discord
+            user_res = await client.get(
+                "https://discord.com/api/users/@me",
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            
+            if user_res.status_code != 200:
+                return RedirectResponse("/?error=user_fetch_failed")
+
+            user_data = user_res.json()
+
+            # 3. Create Session
+            session_id = secrets.token_urlsafe(32)
+            # Store the data so /api/me can find it later
+            sessions[session_id] = {
+                "id": user_data["id"],
+                "username": user_data["username"],
+                "avatar": user_data.get("avatar"),
+                "email": user_data.get("email"),
+                "discriminator": user_data.get("discriminator")
+            }
+
+            # 4. Final Response with Cookie
+            response = RedirectResponse(url=next_url)
+            response.set_cookie(
+                key="session_id",
+                value=session_id,
+                httponly=True,   # Keeps cookie safe from JS
+                secure=True,     # Only sends over HTTPS
+                samesite="lax",  # Allows cookie to work after the Discord redirect
+                max_age=3600 * 24 * 7 # 7 days
+            )
+            return response
+
+        except Exception as e:
+            print(f"Callback error: {e}")
             used_oauth_codes.pop(code, None)
             return RedirectResponse("/?error=server_error")
 
@@ -1549,6 +1583,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
