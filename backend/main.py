@@ -259,15 +259,15 @@ async def discord_callback(
     response = RedirectResponse(next_url)
 
     is_prod = DISCORD_REDIRECT_URI.startswith("https://")
-    
     response.set_cookie(
         key="session_id",
         value=session_id,
         httponly=True,
-        secure=True,          # REQUIRED for SameSite=None
-        samesite="none",      # REQUIRED for cross-site (Netlify → API)
+        secure=is_prod,       # only require secure cookies in prod (HTTPS)
+        samesite="none",
         max_age=60 * 60 * 24 * 7,
     )
+
 
     return response
 
@@ -1620,6 +1620,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
