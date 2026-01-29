@@ -384,6 +384,8 @@ async def discord_callback(
             token_res = await client.post(token_url, data=data, headers=headers, timeout=10)
         
             if token_res.status_code == 429:
+                used_oauth_codes.pop(code, None)
+                used_oauth_states.pop(state, None)
                 retry_after = token_res.headers.get("Retry-After", "2")
                 raise HTTPException(
                     status_code=429,
@@ -413,6 +415,8 @@ async def discord_callback(
             user = user_res.json()
 
     except httpx.HTTPError as e:
+        used_oauth_codes.pop(code, None)
+        used_oauth_states.pop(state, None)
         raise HTTPException(status_code=500, detail=f"HTTP error talking to Discord: {e}")
 
     session_id = secrets.token_urlsafe(32)
@@ -1505,6 +1509,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
