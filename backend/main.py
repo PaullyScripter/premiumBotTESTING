@@ -154,24 +154,40 @@ def safe_next(next_url: str | None) -> str:
 
 
 
-@app.get("/auth/discord/login")
-async def discord_login(next: str | None = Query(default=None)):
-    # make a random state token
-    state = secrets.token_urlsafe(16)
+@app.get("/auth/discord/callback")
+async def discord_callback(code: str, state: str):
+    # 1. Retrieve the 'next' URL from the state session
+    state_key = f"oauth_state:{state}"
+    next_url = sessions.pop(state_key, "/") # use pop to ensure state is only used ONCE
 
-    # store where to go after login
-    sessions[f"oauth_state:{state}"] = safe_next(next)
+    if not next_url and state_key not in sessions:
+        # This prevents the "State Mismatch" loop
+        return RedirectResponse("/?error=invalid_state")
 
-    params = {
+    data = {
         "client_id": DISCORD_CLIENT_ID,
+        "client_secret": DISCORD_CLIENT_SECRET,
+        "grant_type": "authorization_code",
+        "code": code,
         "redirect_uri": DISCORD_REDIRECT_URI,
-        "response_type": "code",
-        "scope": "identify",
-        "state": state,  # ✅ MUST be the token
     }
 
-    url = "https://discord.com/api/oauth2/authorize?" + urlencode(params)
-    return RedirectResponse(url)
+    async with httpx.AsyncClient() as client:
+        res = await client.post("https://discord.com/api/oauth2/token", data=data)
+        
+        # ⚠️ THE FIX FOR YOUR 429
+        if res.status_code == 429:
+            retry_after = res.json().get("retry_after", 5)
+            # Do NOT redirect back into a loop. Return a clean error page.
+            return JSONResponse(
+                status_code=429,
+                content={"error": "rate_limited", "retry_after": retry_after}
+            )
+
+        if res.status_code != 200:
+            return RedirectResponse("/?error=exchange_failed")
+
+        # ... proceed with getting user info and setting session_id cookie ...
 
 def make_avatar_url(user: dict) -> str:
     avatar_hash = user.get("avatar")
@@ -1509,6 +1525,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
