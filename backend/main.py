@@ -616,12 +616,20 @@ async def logout(request: Request):
 
         response.delete_cookie("session_id", secure=True, samesite="none")
     return response
+    
 @app.get("/auth/discord/login")
 async def discord_login(next: str = "/"):
+    # create a fresh random state token
     state = secrets.token_urlsafe(16)
-    # Store state in a way that it won't conflict with previous sessions
-    used_oauth_states[state] = datetime.now(timezone.utc)
-    
+
+    # Save where the user should be returned to after OAuth completes.
+    # This is keyed by the state so the callback can pop it.
+    sessions[f"oauth_state:{state}"] = next
+
+    # DO NOT mark the state as "used" here — that should happen only when the
+    # callback consumes it. The callback already checks used_oauth_states to
+    # block replay; leave used_oauth_states for consumed states only.
+    #
     params = {
         "client_id": DISCORD_CLIENT_ID,
         "redirect_uri": DISCORD_REDIRECT_URI,
@@ -630,6 +638,7 @@ async def discord_login(next: str = "/"):
         "state": state
     }
     return RedirectResponse(f"https://discord.com/api/oauth2/authorize?{urlencode(params)}")
+
 
 @app.get("/api/me")
 def me(request: Request):
@@ -1620,6 +1629,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
