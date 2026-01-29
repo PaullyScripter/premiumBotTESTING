@@ -155,14 +155,21 @@ def safe_next(next_url: str | None) -> str:
 
 
 @app.get("/auth/discord/callback")
-async def discord_callback(code: str, state: str):
-    # 1. Retrieve the 'next' URL from the state session
-    state_key = f"oauth_state:{state}"
-    next_url = sessions.pop(state_key, "/") # use pop to ensure state is only used ONCE
+async def discord_callback(code: str | None = None, state: str | None = None):
+    if not code or not state:
+        return RedirectResponse("/?error=missing_info")
 
-    if not next_url and state_key not in sessions:
-        # This prevents the "State Mismatch" loop
+    # FIX 1: Define the state_key variable before using it
+    state_key = f"oauth_state:{state}"
+    
+    # FIX 2: Check if the state actually exists in sessions
+    if state_key not in sessions:
         return RedirectResponse("/?error=invalid_state")
+        
+    next_url = sessions.pop(state_key, "/") 
+
+    # Mark as used locally to prevent immediate double-processing
+    used_oauth_codes[code] = datetime.now(timezone.utc)
 
     data = {
         "client_id": DISCORD_CLIENT_ID,
@@ -172,22 +179,26 @@ async def discord_callback(code: str, state: str):
         "redirect_uri": DISCORD_REDIRECT_URI,
     }
 
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
     async with httpx.AsyncClient() as client:
-        res = await client.post("https://discord.com/api/oauth2/token", data=data)
-        
-        # ⚠️ THE FIX FOR YOUR 429
-        if res.status_code == 429:
-            retry_after = res.json().get("retry_after", 5)
-            # Do NOT redirect back into a loop. Return a clean error page.
-            return JSONResponse(
-                status_code=429,
-                content={"error": "rate_limited", "retry_after": retry_after}
-            )
+        try:
+            token_res = await client.post("https://discord.com/api/oauth2/token", data=data, headers=headers)
+            
+            if token_res.status_code == 429:
+                # Remove code from 'used' so user can retry after cooling down
+                used_oauth_codes.pop(code, None)
+                retry_after = token_res.json().get("retry_after", 5)
+                return JSONResponse(status_code=429, content={"detail": "Rate limited", "retry_after": retry_after})
 
-        if res.status_code != 200:
-            return RedirectResponse("/?error=exchange_failed")
+            if token_res.status_code != 200:
+                used_oauth_codes.pop(code, None)
+                return RedirectResponse("/?error=exchange_failed")
 
-        # ... proceed with getting user info and setting session_id cookie ...
+            # ... rest of your logic for user info ...
+        except Exception:
+            used_oauth_codes.pop(code, None)
+            return RedirectResponse("/?error=server_error")
 
 def make_avatar_url(user: dict) -> str:
     avatar_hash = user.get("avatar")
@@ -1538,6 +1549,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
