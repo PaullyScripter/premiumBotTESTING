@@ -534,7 +534,20 @@ async def logout(request: Request):
 
         response.delete_cookie("session_id", secure=True, samesite="none")
     return response
-
+@app.get("/auth/discord/login")
+async def discord_login(next: str = "/"):
+    state = secrets.token_urlsafe(16)
+    # Store state in a way that it won't conflict with previous sessions
+    used_oauth_states[state] = datetime.now(timezone.utc)
+    
+    params = {
+        "client_id": DISCORD_CLIENT_ID,
+        "redirect_uri": DISCORD_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "identify email",
+        "state": state
+    }
+    return RedirectResponse(f"https://discord.com/api/oauth2/authorize?{urlencode(params)}")
 
 @app.get("/api/me")
 def me(request: Request):
