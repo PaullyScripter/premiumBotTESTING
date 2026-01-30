@@ -86,17 +86,7 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:8888")
 
-CRYPTOMUS_MERCHANT_ID = os.getenv("CRYPTOMUS_MERCHANT_ID")
-CRYPTOMUS_API_KEY = os.getenv("CRYPTOMUS_API_KEY")
-SELLAUTH_WEBHOOK_SECRET = os.getenv("SELLAUTH_WEBHOOK_SECRET", "change-me")
 
-SELLAUTH_API_KEY = os.getenv("SELLAUTH_API_KEY", "")
-SELLAUTH_SHOP_ID = os.getenv("SELLAUTH_SHOP_ID", "")
-
-if not SELLAUTH_API_KEY:
-    print("WARNING: SELLAUTH_API_KEY is not set")
-if not SELLAUTH_SHOP_ID:
-    print("WARNING: SELLAUTH_SHOP_ID is not set")
 
 
 print("DEBUG DISCORD_CLIENT_ID:", repr(DISCORD_CLIENT_ID))
@@ -104,15 +94,6 @@ print("DEBUG DISCORD_REDIRECT_URI:", repr(DISCORD_REDIRECT_URI))
 
 if not DISCORD_CLIENT_ID or not DISCORD_CLIENT_SECRET or not DISCORD_REDIRECT_URI:
     print("⚠️ Set DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_REDIRECT_URI in .env")
-
-def cleanup_pending_batches():
-    now = datetime.now(timezone.utc)
-    expired = []
-    for token, batch in pending_batches.items():
-        if (now - batch["created_at"]) > timedelta(minutes=30):
-            expired.append(token)
-    for t in expired:
-        pending_batches.pop(t, None)
 
 
 app = FastAPI()
@@ -324,95 +305,6 @@ def get_user_from_session(request: Request) -> dict | None:
 
     # row[0] may already be dict depending on driver; handle both
     return row[0] if isinstance(row[0], dict) else json.loads(row[0])
-
-
-def cryptomus_sign(payload: dict) -> str:
-    """
-    Build Cryptomus signature based on docs:
-    signature = md5(json_string + api_key)
-    """
-    if not CRYPTOMUS_API_KEY:
-        raise RuntimeError("CRYPTOMUS_API_KEY not set")
-
-    # JSON with sorted keys, no spaces
-    json_str = json.dumps(payload, separators=(",", ":"), sort_keys=True)
-    raw = json_str + CRYPTOMUS_API_KEY
-    return hashlib.md5(raw.encode("utf-8")).hexdigest()
-
-def cryptomus_sign_string(json_str: str) -> str:
-    """
-    Signature as Cryptomus expects for webhook:
-    md5( raw_json_string + PAYMENT_API_KEY )
-    """
-    if not CRYPTOMUS_API_KEY:
-        raise RuntimeError("CRYPTOMUS_API_KEY not set")
-    return hashlib.md5((json_str + CRYPTOMUS_API_KEY).encode("utf-8")).hexdigest()
-
-
-def _cryptomus_build_sign_body(data: dict) -> str:
-    json_str = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-    json_str = json_str.replace("/", r"\/")  # match PHP behavior Cryptomus expects
-    return json_str
-
-def cryptomus_sign_request_body(body_str: str) -> str:
-    """
-    Sign for /v1/payment:
-    MD5( base64( body_str ) + API_KEY )
-    """
-    if not CRYPTOMUS_API_KEY:
-        raise RuntimeError("CRYPTOMUS_API_KEY not set")
-
-    b64 = base64.b64encode(body_str.encode("utf-8")).decode("utf-8")
-    return hashlib.md5((b64 + CRYPTOMUS_API_KEY).encode("utf-8")).hexdigest()
-
-def cryptomus_sign(data: dict) -> str:
-    """
-    Signature for verifying incoming webhook:
-    MD5(base64(JSON-without-sign) + API_KEY)
-    """
-    tmp = dict(data)
-    if "sign" in tmp:
-        tmp.pop("sign")
-
-    json_str = _cryptomus_build_sign_body(tmp)
-    b64 = base64.b64encode(json_str.encode("utf-8")).decode("utf-8")
-    return hashlib.md5((b64 + CRYPTOMUS_API_KEY).encode("utf-8")).hexdigest()
-
-def cryptomus_verify_webhook_signature(raw_body: bytes, header_sign: str | None) -> dict:
-    """
-    Verify Cryptomus webhook signature using the Payment API key.
-
-    According to their webhook docs:
-      sign = md5(json_string + PAYMENT_API_KEY)
-    """
-    if not CRYPTOMUS_API_KEY:
-        raise HTTPException(status_code=500, detail="Cryptomus API key not configured")
-
-    if not header_sign:
-        raise HTTPException(status_code=400, detail="Missing signature")
-
-    # Use the RAW JSON string as sent in HTTP body
-    json_str = raw_body.decode("utf-8")
-
-    # Build expected sign
-    expected = hashlib.md5((json_str + CRYPTOMUS_API_KEY).encode("utf-8")).hexdigest()
-
-    # Debug log (safe – does not print the API key)
-    print("WEBHOOK HEADER SIGN:", header_sign)
-    print("WEBHOOK EXPECTED SIGN:", expected)
-    print("WEBHOOK RAW BODY:", json_str)
-
-    if header_sign != expected:
-        # Signature wrong → don't grant premium
-        raise HTTPException(status_code=401, detail="Invalid signature")
-
-    # Parse JSON payload after signature check
-    try:
-        payload = json.loads(json_str)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    return payload
     
 ALLOWED_FRONTEND_HOSTS = {"equinoxbot.netlify.app"}  # change if needed
 
@@ -703,165 +595,6 @@ def api_premium_me(request: Request):
         "tier": tier,
         "expires_at": expires,
     }
-
-
-
-@app.post("/api/create-invoice")
-async def create_invoice(request: Request, body: dict = Body(...)):
-    """
-    Create a Cryptomus payment invoice for the logged-in user.
-    Expects JSON body: { "plan": "monthly" | "yearly" | "lifetime" }
-    """
-    user = get_user_from_session(request)
-    if not user:
-        raise HTTPException(status_code=401, detail="Not logged in")
-
-    if not CRYPTOMUS_MERCHANT_ID or not CRYPTOMUS_API_KEY:
-        raise HTTPException(status_code=500, detail="Cryptomus not configured")
-
-    plan = (body.get("plan") or "monthly").lower()
-
-    # 💰 real prices here:
-    if plan == "monthly":
-        amount = "2.99"
-    elif plan == "yearly":
-        amount = "29.99"
-    elif plan == "lifetime":
-        amount = "10.10"
-    else:
-        raise HTTPException(status_code=400, detail="Invalid plan")
-
-    discord_id = str(user["id"])
-
-    custom_data = {
-        "discord_id": discord_id,
-        "plan": plan,
-    }
-
-    # where to send the user back if they click "Back to site" on the payment page
-    url_return = FRONTEND_URL or "https://equinoxbot.netlify.app/premium.html"
-    url_success = "https://equinoxbot.netlify.app/thankyou.html"
-
-    # our webhook endpoint (this is the important part!)
-    base_url = f"{request.url.scheme}://{request.url.netloc}"
-    url_callback = f"{base_url}/api/cryptomus/webhook"
-
-    order_id = f"{discord_id}-{plan}-{secrets.token_hex(4)}"
-
-    invoice_payload = {
-        "amount": amount,
-        "currency": "USD",
-        "order_id": order_id,
-        "url_return": url_return,
-        "url_success": url_success,
-        "url_callback": url_callback,
-        "is_payment_multiple": True,
-        "lifetime": 7200,
-        "additional_data": json.dumps(custom_data, ensure_ascii=False),
-    }
-
-    # 1) build the exact JSON string Cryptomus will receive
-    body_str = json.dumps(invoice_payload, ensure_ascii=False, separators=(",", ":"))
-
-    # 2) compute sign from that string
-    sign = cryptomus_sign_request_body(body_str)
-
-    headers = {
-        "merchant": CRYPTOMUS_MERCHANT_ID,
-        "sign": sign,
-        "Content-Type": "application/json",
-    }
-
-    # 3) send that same string as the body
-    async with httpx.AsyncClient() as client_http:
-        res = await client_http.post(
-            "https://api.cryptomus.com/v1/payment",
-            headers=headers,
-            content=body_str.encode("utf-8"),
-            timeout=20,
-        )
-
-    print("CRYPTOMUS INVOICE STATUS:", res.status_code)
-    print("CRYPTOMUS INVOICE BODY:", res.text)
-
-    if res.status_code != 200:
-        raise HTTPException(status_code=502, detail="Failed to create invoice")
-
-    data = res.json()
-
-    result = data.get("result") or {}
-    invoice_url = result.get("url")
-    if not invoice_url:
-        raise HTTPException(status_code=502, detail="Invoice URL missing in response")
-
-    return {
-        "invoice_url": invoice_url,
-        "order_id": result.get("order_id") or order_id,
-        "uuid": result.get("uuid"),
-    }
-@app.post("/api/cryptomus/webhook")
-async def cryptomus_webhook(
-    request: Request,
-    sign: str | None = Header(default=None),
-):
-    """
-    Real Cryptomus webhook:
-    - verify signature using PAYMENT API KEY
-    - accept only 'paid' / 'paid_over'
-    - read custom / additional_data { discord_id, plan }
-    - grant subscription by writing JSON
-    """
-    if not CRYPTOMUS_MERCHANT_ID or not CRYPTOMUS_API_KEY:
-        raise HTTPException(status_code=500, detail="Cryptomus not configured")
-
-    # Read raw body exactly as Cryptomus sent it
-    raw_body = await request.body()
-
-    # 1) Verify signature and parse JSON
-    payload = cryptomus_verify_webhook_signature(raw_body, sign)
-
-    status = payload.get("status")
-    print("WEBHOOK STATUS FIELD:", status)
-
-    # 2) Only handle successful payments
-    if status not in ("paid", "paid_over"):
-        # Log and ignore everything else (check, process, cancel, etc.)
-        print("WEBHOOK IGNORED STATUS:", status)
-        return {"ok": True, "message": f"Ignored status {status}"}
-
-    # 3) Extract our custom data
-    #    We used "additional_data" when creating invoices.
-    #    Some setups use "custom". Support both just in case.
-    custom_raw = payload.get("custom") or payload.get("additional_data") or "{}"
-    print("WEBHOOK CUSTOM RAW:", custom_raw)
-
-    try:
-        custom = json.loads(custom_raw)
-    except Exception:
-        custom = {}
-        print("WEBHOOK CUSTOM PARSE FAILED, GOT EMPTY DICT")
-
-    discord_id = custom.get("discord_id")
-    plan = custom.get("plan")
-
-    print("WEBHOOK DISCORD_ID:", discord_id)
-    print("WEBHOOK PLAN:", plan)
-
-    if not discord_id or not plan:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing discord_id or plan in webhook data",
-        )
-
-    # 4) Grant subscription using your JSON-based logic
-    try:
-        grant_subscription_from_webhook(str(discord_id), plan, payload)
-    except Exception as e:
-        print("ERROR in grant_subscription_from_webhook:", e)
-        raise HTTPException(status_code=500, detail="Failed to grant subscription")
-
-    print(f"WEBHOOK SUCCESSFULLY GRANTED {plan} TO {discord_id}")
-    return {"ok": True, "message": f"Subscription granted for {discord_id} ({plan})"}
 
 CODE_PATTERN = re.compile(r"^[A-Za-z0-9]{4}(-[A-Za-z0-9]{4}){3}$")
 
@@ -1653,6 +1386,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
