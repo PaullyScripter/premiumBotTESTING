@@ -102,6 +102,7 @@ app = FastAPI()
 FRONTEND_ORIGINS = [
     "http://localhost:5500",                 # local dev
     "https://equinoxbot.netlify.app",        # your real Netlify site
+    "https://equinoxtest.netlify.app"
 ]
 
 
@@ -1290,6 +1291,7 @@ if __name__ == "__main__":
     import os, uvicorn
     port = int(os.getenv("SERVER_PORT") or os.getenv("PORT") or "25766")
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 
 
