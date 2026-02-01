@@ -143,7 +143,106 @@ if discord_rate_limited_until and discord_rate_limited_until > now:
         detail={"message": "Server temporarily rate-limited by Discord.", "retry_after": retry_secs},
         headers={"Retry-After": str(retry_secs)},
     )
+# 1. AT THE TOP OF YOUR FILE (Global State)
+discord_rate_limited_until: datetime | None = None
 
+# 2. HELPER TO CHECK COOLDOWN (Add this)
+def check_discord_cooldown():
+    global discord_rate_limited_until
+    if discord_rate_limited_until:
+        now = datetime.now(timezone.utc)
+        if now < discord_rate_limited_until:
+            retry_secs = int((discord_rate_limited_until - now).total_seconds())
+            print(f"🛑 [BLOCKING] Discord call prevented. Global cooldown active for {retry_secs}s")
+            raise HTTPException(
+                status_code=429,
+                detail={"message": "Global Discord Cooldown", "retry_after": retry_secs}
+            )
+        else:
+            discord_rate_limited_until = None # Cooldown expired
+
+# 3. UPDATED CALLBACK (Cleaned and Fixed)
+@app.get("/auth/discord/callback")
+async def discord_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+):
+    global discord_rate_limited_until
+    
+    if error:
+        raise HTTPException(status_code=400, detail=f"Discord OAuth error: {error}")
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing 'code' parameter")
+
+    # PRE-FLIGHT CHECK
+    check_discord_cooldown()
+
+    now = datetime.now(timezone.utc)
+    
+    # Check if code was already processed (Prevents double-click bugs)
+    if code in used_oauth_codes:
+        print(f"⚠️ [DEBUG] Code {code[:5]}... already processed. Redirecting to home.")
+        return RedirectResponse(FRONTEND_URL)
+
+    # Mark state/code as used immediately
+    used_oauth_codes[code] = now
+    used_oauth_states[state] = now if state else now
+
+    next_url = sessions.pop(f"oauth_state:{state}", FRONTEND_URL)
+    next_url = safe_next(next_url)
+
+    async with httpx.AsyncClient() as client:
+        # --- CALL 1: TOKEN EXCHANGE ---
+        print(f"🚀 [DISCORD CALL] Exchanging Code for Token...")
+        token_res = await client.post(
+            "https://discord.com/api/oauth2/token",
+            data={
+                "client_id": DISCORD_CLIENT_ID,
+                "client_secret": DISCORD_CLIENT_SECRET,
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": DISCORD_REDIRECT_URI,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=10
+        )
+
+        if token_res.status_code == 429:
+            retry_after = int(token_res.headers.get("Retry-After", 60))
+            discord_rate_limited_until = datetime.now(timezone.utc) + timedelta(seconds=retry_after)
+            print(f"❌ [RATE LIMIT] Discord said 429. Locking all calls for {retry_after}s")
+            raise HTTPException(status_code=429, detail={"retry_after": retry_after})
+
+        token_res.raise_for_status()
+        access_token = token_res.json()["access_token"]
+
+        # --- CALL 2: GET USER ---
+        print(f"🚀 [DISCORD CALL] Fetching User @me...")
+        user_res = await client.get(
+            "https://discord.com/api/users/@me",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10
+        )
+        user_res.raise_for_status()
+        user = user_res.json()
+
+    # Session logic...
+    session_id = secrets.token_urlsafe(32)
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO public.web_sessions (session_id, user_json) VALUES (%s, %s)",
+                (session_id, json.dumps(user)),
+            )
+        conn.commit()
+
+    response = RedirectResponse(next_url)
+    response.set_cookie(
+        key="session_id", value=session_id, httponly=True,
+        secure=True, samesite="none", max_age=604800
+    )
+    return response
 
 @app.get("/auth/discord/callback")
 async def discord_callback(
@@ -151,19 +250,28 @@ async def discord_callback(
     state: str | None = None,
     error: str | None = None,
 ):
-    """
-    Discord redirects here with ?code=...&state=...
-    We exchange it for a token, get the user, create a session,
-    then redirect back to the page user started login from.
-    """
+    # Access the global variable defined at the top of your file
+    global discord_rate_limited_until
+
     if error:
         raise HTTPException(status_code=400, detail=f"Discord OAuth error: {error}")
 
     if not code:
         raise HTTPException(status_code=400, detail="Missing 'code' parameter")
+
     now = datetime.now(timezone.utc)
+
+    # --- FIX 1: STRICT GLOBAL COOLDOWN CHECK ---
+    if discord_rate_limited_until and discord_rate_limited_until > now:
+        retry_secs = int((discord_rate_limited_until - now).total_seconds())
+        print(f"🛑 [BLOCKING] Discord call prevented. Global cooldown active for {retry_secs}s")
+        raise HTTPException(
+            status_code=429,
+            detail={"message": "Server temporarily rate-limited by Discord.", "retry_after": retry_secs},
+            headers={"Retry-After": str(retry_secs)},
+        )
         
-    # 1. Cleanup old entries to prevent memory leaks/endless rate limiting
+    # 1. Cleanup old entries
     expiry_limit = now - timedelta(minutes=10)
     for k in [k for k, v in used_oauth_codes.items() if v < expiry_limit]:
         used_oauth_codes.pop(k, None)
@@ -172,83 +280,75 @@ async def discord_callback(
     
     # 2. Check if the current code/state was recently used
     if code in used_oauth_codes:
-        print(f"DEBUG: Code {code} already used recently. Redirecting.")
+        print(f"⚠️ [DEBUG] Code {code[:5]}... already processed recently. Redirecting.")
         return RedirectResponse(FRONTEND_URL)
         
     if not state or state in used_oauth_states:
-        print(f"DEBUG: State {state} invalid or already used. Redirecting.")
+        print(f"⚠️ [DEBUG] State {state} invalid or already used. Redirecting.")
         return RedirectResponse(FRONTEND_URL)
     
-    # 3. Mark as used with a timestamp
+    # 3. Mark as used
     used_oauth_codes[code] = now
     used_oauth_states[state] = now
 
-    # ✅ retrieve where the user wanted to go back to
     next_url = sessions.pop(f"oauth_state:{state}", FRONTEND_URL)
     next_url = safe_next(next_url)
 
-    token_url = "https://discord.com/api/oauth2/token"
-    data = {
-        "client_id": DISCORD_CLIENT_ID,
-        "client_secret": DISCORD_CLIENT_SECRET,
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": DISCORD_REDIRECT_URI,
-    }
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-
     try:
         async with httpx.AsyncClient() as client:
-            token_res = await client.post(token_url, data=data, headers=headers, timeout=10)
+            # --- CALL 1: TOKEN EXCHANGE ---
+            print("🚀 [DISCORD CALL] Exchanging code for token...")
+            token_res = await client.post(
+                "https://discord.com/api/oauth2/token",
+                data={
+                    "client_id": DISCORD_CLIENT_ID,
+                    "client_secret": DISCORD_CLIENT_SECRET,
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": DISCORD_REDIRECT_URI,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=10
+            )
         
             if token_res.status_code == 429:
-                # read Retry-After in seconds (header may be missing)
                 retry_after_header = token_res.headers.get("Retry-After")
                 try:
                     retry_after = int(retry_after_header) if retry_after_header else 60
                 except Exception:
                     retry_after = 60
             
-                # set global cooldown
+                # --- FIX 2: UPDATE GLOBAL COOLDOWN ---
                 discord_rate_limited_until = datetime.now(timezone.utc) + timedelta(seconds=retry_after)
+                print(f"❌ [RATE LIMIT] Discord 429 received. Locking calls for {retry_after}s")
             
-                # clear ephemeral state so user can try again later
                 used_oauth_codes.pop(code, None)
                 used_oauth_states.pop(state, None)
             
-                # surface a friendly message (and include Retry-After header)
                 raise HTTPException(
                     status_code=429,
-                    detail={
-                        "message": "Rate limited by Discord. Try again shortly.",
-                        "retry_after": retry_after,
-                    },
+                    detail={"message": "Rate limited by Discord. Try again shortly.", "retry_after": retry_after},
                     headers={"Retry-After": str(retry_after)},
                 )
 
-        
-            print("TOKEN RESPONSE STATUS:", token_res.status_code)
-            print("TOKEN RESPONSE BODY:", token_res.text)
-        
             token_res.raise_for_status()
-            token_data = token_res.json()
-            access_token = token_data["access_token"]
+            access_token = token_res.json()["access_token"]
 
-
+            # --- CALL 2: GET USER ---
+            print("🚀 [DISCORD CALL] Fetching user profile...")
             user_res = await client.get(
                 "https://discord.com/api/users/@me",
                 headers={"Authorization": f"Bearer {access_token}"},
                 timeout=10,
             )
-            print("USER RESPONSE STATUS:", user_res.status_code)
-            print("USER RESPONSE BODY:", user_res.text)
             user_res.raise_for_status()
             user = user_res.json()
 
     except httpx.HTTPError as e:
         used_oauth_codes.pop(code, None)
         used_oauth_states.pop(state, None)
-        raise HTTPException(status_code=500, detail=f"HTTP error talking to Discord: {e}")
+        print(f"❌ [HTTP ERROR] Talk to Discord failed: {e}")
+        raise HTTPException(status_code=500, detail="Communication with Discord failed.")
 
     session_id = secrets.token_urlsafe(32)
     with get_db() as conn:
@@ -259,20 +359,16 @@ async def discord_callback(
             )
         conn.commit()
 
-
-    # ✅ redirect back to where they started
     response = RedirectResponse(next_url)
-
     is_prod = DISCORD_REDIRECT_URI.startswith("https://")
     response.set_cookie(
         key="session_id",
         value=session_id,
         httponly=True,
-        secure=is_prod,       # only require secure cookies in prod (HTTPS)
+        secure=is_prod,
         samesite="none",
-        max_age=60 * 60 * 24 * 7,
+        max_age=604800, # 7 days
     )
-
 
     return response
 
@@ -341,123 +437,6 @@ def api_premium(discord_id: str):
 
 
 
-@app.get("/auth/discord/callback")
-async def discord_callback(
-    code: str | None = None,
-    state: str | None = None,
-    error: str | None = None,
-):
-    """
-    Discord redirects here with ?code=...&state=...
-    We exchange it for a token, get the user, create a session,
-    then redirect back to the page user started login from.
-    """
-    if error:
-        raise HTTPException(status_code=400, detail=f"Discord OAuth error: {error}")
-
-    if not code:
-        raise HTTPException(status_code=400, detail="Missing 'code' parameter")
-    now = datetime.now(timezone.utc)
-        
-    # 1. Cleanup old entries to prevent memory leaks/endless rate limiting
-    expiry_limit = now - timedelta(minutes=10)
-    for k in [k for k, v in used_oauth_codes.items() if v < expiry_limit]:
-        used_oauth_codes.pop(k, None)
-    for k in [k for k, v in used_oauth_states.items() if v < expiry_limit]:
-        used_oauth_states.pop(k, None)
-    
-    # 2. Check if the current code/state was recently used
-    if code in used_oauth_codes:
-        print(f"DEBUG: Code {code} already used recently. Redirecting.")
-        return RedirectResponse(FRONTEND_URL)
-        
-    if not state or state in used_oauth_states:
-        print(f"DEBUG: State {state} invalid or already used. Redirecting.")
-        return RedirectResponse(FRONTEND_URL)
-    
-    # 3. Mark as used with a timestamp
-    used_oauth_codes[code] = now
-    used_oauth_states[state] = now
-
-    # ✅ retrieve where the user wanted to go back to
-    next_url = sessions.pop(f"oauth_state:{state}", FRONTEND_URL)
-    next_url = safe_next(next_url)
-
-    token_url = "https://discord.com/api/oauth2/token"
-    data = {
-        "client_id": DISCORD_CLIENT_ID,
-        "client_secret": DISCORD_CLIENT_SECRET,
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": DISCORD_REDIRECT_URI,
-    }
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-
-    try:
-        async with httpx.AsyncClient() as client:
-            token_res = await client.post(token_url, data=data, headers=headers, timeout=10)
-        
-            if token_res.status_code == 429:
-                used_oauth_codes.pop(code, None)
-                used_oauth_states.pop(state, None)
-                retry_after = token_res.headers.get("Retry-After", "2")
-                raise HTTPException(
-                    status_code=429,
-                    detail={
-                        "message": "Rate limited by Discord. Try again shortly.",
-                        "retry_after": retry_after,
-                    },
-                    headers={"Retry-After": retry_after},
-                )
-        
-            print("TOKEN RESPONSE STATUS:", token_res.status_code)
-            print("TOKEN RESPONSE BODY:", token_res.text)
-        
-            token_res.raise_for_status()
-            token_data = token_res.json()
-            access_token = token_data["access_token"]
-
-
-            user_res = await client.get(
-                "https://discord.com/api/users/@me",
-                headers={"Authorization": f"Bearer {access_token}"},
-                timeout=10,
-            )
-            print("USER RESPONSE STATUS:", user_res.status_code)
-            print("USER RESPONSE BODY:", user_res.text)
-            user_res.raise_for_status()
-            user = user_res.json()
-
-    except httpx.HTTPError as e:
-        used_oauth_codes.pop(code, None)
-        used_oauth_states.pop(state, None)
-        raise HTTPException(status_code=500, detail=f"HTTP error talking to Discord: {e}")
-
-    session_id = secrets.token_urlsafe(32)
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO public.web_sessions (session_id, user_json) VALUES (%s, %s)",
-                (session_id, json.dumps(user)),
-            )
-        conn.commit()
-
-
-    # ✅ redirect back to where they started
-    response = RedirectResponse(next_url)
-
-    is_prod = DISCORD_REDIRECT_URI.startswith("https://")
-    
-    response.set_cookie(
-        key="session_id",
-        value=session_id,
-        httponly=True,
-        secure=True,          # REQUIRED for SameSite=None
-        samesite="none",      # REQUIRED for cross-site (Netlify → API)
-        max_age=60 * 60 * 24 * 7,
-    )
-
-    return response
 
 
 @app.get("/api/subscription")
@@ -1386,6 +1365,7 @@ async def startup_tasks():
 @app.get("/")
 async def root():
     return {"ok": True}
+
 
 
 
