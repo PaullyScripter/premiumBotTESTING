@@ -162,88 +162,6 @@ def check_discord_cooldown():
         else:
             discord_rate_limited_until = None # Cooldown expired
 
-# 3. UPDATED CALLBACK (Cleaned and Fixed)
-@app.get("/auth/discord/callback")
-async def discord_callback(
-    code: str | None = None,
-    state: str | None = None,
-    error: str | None = None,
-):
-    global discord_rate_limited_until
-    
-    if error:
-        raise HTTPException(status_code=400, detail=f"Discord OAuth error: {error}")
-    if not code:
-        raise HTTPException(status_code=400, detail="Missing 'code' parameter")
-
-    # PRE-FLIGHT CHECK
-    check_discord_cooldown()
-
-    now = datetime.now(timezone.utc)
-    
-    # Check if code was already processed (Prevents double-click bugs)
-    if code in used_oauth_codes:
-        print(f"⚠️ [DEBUG] Code {code[:5]}... already processed. Redirecting to home.")
-        return RedirectResponse(FRONTEND_URL)
-
-    # Mark state/code as used immediately
-    used_oauth_codes[code] = now
-    used_oauth_states[state] = now if state else now
-
-    next_url = sessions.pop(f"oauth_state:{state}", FRONTEND_URL)
-    next_url = safe_next(next_url)
-
-    async with httpx.AsyncClient() as client:
-        # --- CALL 1: TOKEN EXCHANGE ---
-        print(f"🚀 [DISCORD CALL] Exchanging Code for Token...")
-        token_res = await client.post(
-            "https://discord.com/api/oauth2/token",
-            data={
-                "client_id": DISCORD_CLIENT_ID,
-                "client_secret": DISCORD_CLIENT_SECRET,
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": DISCORD_REDIRECT_URI,
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=10
-        )
-
-        if token_res.status_code == 429:
-            retry_after = int(token_res.headers.get("Retry-After", 60))
-            discord_rate_limited_until = datetime.now(timezone.utc) + timedelta(seconds=retry_after)
-            print(f"❌ [RATE LIMIT] Discord said 429. Locking all calls for {retry_after}s")
-            raise HTTPException(status_code=429, detail={"retry_after": retry_after})
-
-        token_res.raise_for_status()
-        access_token = token_res.json()["access_token"]
-
-        # --- CALL 2: GET USER ---
-        print(f"🚀 [DISCORD CALL] Fetching User @me...")
-        user_res = await client.get(
-            "https://discord.com/api/users/@me",
-            headers={"Authorization": f"Bearer {access_token}"},
-            timeout=10
-        )
-        user_res.raise_for_status()
-        user = user_res.json()
-
-    # Session logic...
-    session_id = secrets.token_urlsafe(32)
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO public.web_sessions (session_id, user_json) VALUES (%s, %s)",
-                (session_id, json.dumps(user)),
-            )
-        conn.commit()
-
-    response = RedirectResponse(next_url)
-    response.set_cookie(
-        key="session_id", value=session_id, httponly=True,
-        secure=True, samesite="none", max_age=604800
-    )
-    return response
 
 @app.get("/auth/discord/callback")
 async def discord_callback(
@@ -1372,6 +1290,7 @@ if __name__ == "__main__":
     import os, uvicorn
     port = int(os.getenv("SERVER_PORT") or os.getenv("PORT") or "25766")
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 
 
