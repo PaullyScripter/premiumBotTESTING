@@ -16,6 +16,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import hashlib
 import json
+from fastapi import FastAPI
 import httpx
 from typing import Literal
 import hashlib
@@ -1371,6 +1372,7 @@ if __name__ == "__main__":
     import os, uvicorn
     port = int(os.getenv("SERVER_PORT") or os.getenv("PORT") or "25766")
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 
 
